@@ -414,6 +414,12 @@
             // Form submission
             if (uploadForm) {
                 uploadForm.addEventListener('submit', async function(e) {
+                    // Reset stop button state for new job
+                    const stopBtn = document.getElementById('stopBtn');
+                    if (stopBtn) {
+                        stopBtn.disabled = false;
+                        stopBtn.innerHTML = '<i class="bi bi-stop-circle me-2"></i>Stop Processing & Download Results';
+                    }
                     console.log('Form submission started');
                     e.preventDefault();
                     
@@ -658,6 +664,11 @@
             document.getElementById('statusDisplay').style.display = 'none';
             document.getElementById('progressDisplay').style.display = 'block';
             document.getElementById('stopButtonContainer').style.display = 'block';
+            // Attach stop button event handler every time it is shown
+            const stopBtn = document.getElementById('stopBtn');
+            if (stopBtn) {
+                stopBtn.onclick = stopProcessing;
+            }
         }
 
         function hideUploadSection() {
@@ -817,6 +828,12 @@
             document.getElementById('fileInfoCard').style.display = 'none';
             document.getElementById('progressDisplay').style.display = 'none';
             document.getElementById('stopButtonContainer').style.display = 'none';
+            // Reset stop button state
+            const stopBtn = document.getElementById('stopBtn');
+            if (stopBtn) {
+                stopBtn.disabled = false;
+                stopBtn.innerHTML = '<i class="bi bi-stop-circle me-2"></i>Stop Processing & Download Results';
+            }
             document.getElementById('downloadSection').style.display = 'none';
             document.getElementById('errorSection').style.display = 'none';
             

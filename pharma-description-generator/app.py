@@ -202,6 +202,7 @@ def upload_file():
         return jsonify({'success': False, 'error': f'Upload failed: {str(e)}'})
 
 
+
 @app.route('/progress/<job_id>')
 def get_progress(job_id):
     """
@@ -210,7 +211,7 @@ def get_progress(job_id):
     job = processing_jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
-    
+
     elapsed_time = ""
     estimated_time = "Calculating..."
     if job.start_time:
@@ -233,6 +234,17 @@ def get_progress(job_id):
         else:
             estimated_time = "Estimating..."
 
+    # Try to get failed_count and rate_limit_count if available
+    failed_count = 0
+    rate_limit_count = 0
+    if hasattr(job, 'failed_count'):
+        failed_count = job.failed_count
+    elif hasattr(job, 'results') and isinstance(job.results, list):
+        failed_count = len([r for r in job.results if isinstance(r, dict) and r.get('status') == 'failed'])
+
+    if hasattr(job, 'rate_limit_count'):
+        rate_limit_count = job.rate_limit_count
+
     return jsonify({
         'status': job.status,
         'progress': job.progress_percentage,
@@ -242,7 +254,9 @@ def get_progress(job_id):
         'elapsed_time': elapsed_time,
         'estimated_time': estimated_time,
         'error_message': job.error_message,
-        'can_download': job.status in ['completed', 'stopped'] and job.output_file is not None
+        'can_download': job.status in ['completed', 'stopped'] and job.output_file is not None,
+        'failed_count': failed_count,
+        'rate_limit_count': rate_limit_count
     })
 
 
