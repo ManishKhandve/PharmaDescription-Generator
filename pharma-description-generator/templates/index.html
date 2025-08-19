@@ -762,6 +762,13 @@
 
         // Update progress display
         function updateProgress(progress) {
+            // Show rate limit warning if rate_limited is true
+            var rateLimitWarning = document.getElementById('rateLimitWarning');
+            if (progress && progress.rate_limited) {
+                if (rateLimitWarning) rateLimitWarning.classList.remove('d-none');
+            } else {
+                if (rateLimitWarning) rateLimitWarning.classList.add('d-none');
+            }
             const progressBar = document.getElementById('progressBar');
             const progressPercent = document.getElementById('progressPercent');
             const processedCount = document.getElementById('processedCount');
@@ -804,12 +811,13 @@
             }
 
             // Rate limit warning logic
-            const rateLimitWarning = document.getElementById('rateLimitWarning');
             if (progress.rate_limit_count && progress.rate_limit_count > 0) {
-                rateLimitWarning.classList.remove('d-none');
-                rateLimitWarning.innerHTML = `<i class='bi bi-exclamation-triangle me-1'></i>API rate limit detected (${progress.rate_limit_count} times). Processing may be slowed down. Please wait or try reducing batch size.`;
+                if (rateLimitWarning) {
+                    rateLimitWarning.classList.remove('d-none');
+                    rateLimitWarning.innerHTML = `<i class='bi bi-exclamation-triangle me-1'></i>API rate limit detected (${progress.rate_limit_count} times). Processing may be slowed down. Please wait or try reducing batch size.`;
+                }
             } else {
-                rateLimitWarning.classList.add('d-none');
+                if (rateLimitWarning) rateLimitWarning.classList.add('d-none');
             }
         }
 

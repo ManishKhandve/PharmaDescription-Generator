@@ -1,8 +1,3 @@
-"""
-Flask Web Application for Pharmaceutical Product Description Generation
-Main application file handling web interface, file uploads, and processing coordination.
-"""
-
 import os
 import asyncio
 import threading
@@ -380,120 +375,184 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
         job.total_products = len(product_info_list)
         job.original_data = original_data  # Store original data in job
 
-
-    # Initialize LLM client and batch processor with increased batch size for more parallelism
-    llm_client = LLMClient(api_key, model_type)
-    processor = BatchProcessor(llm_client, batch_size=10)  # Increased for more parallelism
+        # Set batch size: 5 for >1000 products, else 3
+        batch_size = 5 if len(product_info_list) > 1000 else 3
+        llm_client = LLMClient(api_key, model_type)
+        processor = BatchProcessor(llm_client, batch_size=batch_size)
 
         # Enhanced progress callback function that handles failed count
         def progress_callback(progress_pct: int, processed: int, total: int, failed: int = 0):
-            if processed > 0 and len(processor.cache) > 0:
-                # Get last processed product name
-                last_result = list(processor.cache.values())[-1]
-                current_product = last_result.get('product_name', 'Unknown')
-                job.update_progress(processed, current_product)
-
-                # Log progress for large datasets
-                if total > 100 and processed % 50 == 0:  # Log every 50 products for large datasets
-                    logger.info(f"Progress: {processed}/{total} ({progress_pct}%) processed, {failed} failed")
+            # Only update progress and log after a batch is fully completed (to match frontend)
+            if processed > 0:
+                # Find the last product in the current batch
+                current_product = None
+                if len(processor.cache) > 0:
+                    last_result = list(processor.cache.values())[-1]
+                    current_product = last_result.get('product_name', 'Unknown')
+                job.update_progress(processed, current_product or "")
+                # Log progress for large datasets only after batch
+                if total > 100 and processed % 50 == 0:
+                    logger.info(f"Progress: {processed}/{total} ({progress_pct}%) processed, {failed} failed (batch complete)")
 
         # Stop check function
         def stop_check():
             return job.stop_requested
 
         # Run async processing
-
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            logger.info(f"Starting processing job {job_id} with {model_type}")
-            job.status = "processing"
+            results = loop.run_until_complete(
+                processor.process_products(product_info_list, progress_callback, stop_check)
+            )
+        finally:
+            loop.close()
 
-            # Read products from Excel file and preserve original data
-            product_info_list, original_data = ExcelHandler.read_input_file(file_path)
-            job.total_products = len(product_info_list)
-            job.original_data = original_data  # Store original data in job
+        # Helper to check which products are missing descriptions
+        def get_missing_products(product_info_list, results):
+            described_names = set()
+            for r in results:
+                if isinstance(r, dict) and r.get('description') and r.get('product_name'):
+                    described_names.add(r['product_name'])
+            missing = [p for p in product_info_list if p.get('product_name') not in described_names]
+            return missing
 
-            # Initialize LLM client and batch processor with increased batch size for more parallelism
-            llm_client = LLMClient(api_key, model_type)
-            processor = BatchProcessor(llm_client, batch_size=10)  # Increased for more parallelism
+        # Handle processing results
 
-            # Enhanced progress callback function that handles failed count
-            def progress_callback(progress_pct: int, processed: int, total: int, failed: int = 0):
-                if processed > 0 and len(processor.cache) > 0:
-                    # Get last processed product name
-                    last_result = list(processor.cache.values())[-1]
-                    current_product = last_result.get('product_name', 'Unknown')
-                    job.update_progress(processed, current_product)
+        if not results:
+            if job.stop_requested:
+                raise Exception("Processing stopped by user request with no results")
+            else:
+                raise Exception("No results generated")
 
-                    # Log progress for large datasets
-                    if total > 100 and processed % 50 == 0:  # Log every 50 products for large datasets
-                        logger.info(f"Progress: {processed}/{total} ({progress_pct}%) processed, {failed} failed")
+        # Filter out exceptions from failed tasks
+        valid_results = []
+        for result in results:
+            if isinstance(result, dict):
+                valid_results.append(result)
+            else:
+                logger.warning(f"Skipping invalid result: {result}")
 
-            # Stop check function
-            def stop_check():
-                return job.stop_requested
 
-            # Run async processing
+        # Improved retry for missing products: always retry all missing in each round, robust merging, and log after each retry
+        max_retries = 5
+        retry_count = 0
+        all_results = valid_results[:]
+        while retry_count < max_retries:
+            missing_products = get_missing_products(product_info_list, all_results)
+            logger.warning(f"[Retry {retry_count+1}] {len(missing_products)} products missing descriptions.")
+            if not missing_products or job.stop_requested:
+                break
+            # Re-process all missing products
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                results = loop.run_until_complete(
-                    processor.process_products(product_info_list, progress_callback, stop_check)
+                retry_results = loop.run_until_complete(
+                    processor.process_products(missing_products, progress_callback, stop_check)
                 )
             finally:
                 loop.close()
+            # Merge: always keep only the latest result for each product_name
+            result_map = {r['product_name']: r for r in all_results if isinstance(r, dict) and r.get('product_name')}
+            for r in retry_results:
+                if isinstance(r, dict) and r.get('product_name'):
+                    result_map[r['product_name']] = r
+            all_results = list(result_map.values())
+            retry_count += 1
+        # Final check for missing
+        missing_products = get_missing_products(product_info_list, all_results)
+        if missing_products and not job.stop_requested:
+            logger.error(f"After {max_retries} retries, {len(missing_products)} products still missing descriptions.")
+        else:
+            logger.info(f"All products processed after {retry_count} retries.")
 
-            # Handle processing results
-            if not results:
-                if job.stop_requested:
-                    raise Exception("Processing stopped by user request with no results")
-                else:
-                    raise Exception("No results generated")
+        # Store results in job for later download
+        job.results = all_results
 
-            # Filter out exceptions from failed tasks
-            valid_results = []
-            for result in results:
-                if isinstance(result, dict):
-                    valid_results.append(result)
-                else:
-                    logger.warning(f"Skipping invalid result: {result}")
+        # Create output file
+        output_filename = f"output_{job_id}.xlsx"
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
 
-            if not valid_results:
-                if job.stop_requested:
-                    raise Exception("Processing stopped by user request")
-                else:
-                    raise Exception("All processing tasks failed")
+        # Create the actual output file
+        ExcelHandler.create_output_file(all_results, output_path, job.original_data)
 
-            # Store results in job for later download
-            job.results = valid_results
+        # Mark job as completed or stopped
+        if job.stop_requested:
+            job.stop(output_path)
+            logger.info(f"Job {job_id} stopped by user. Processed {len(all_results)} products.")
+        else:
+            job.complete(output_path)
+            logger.info(f"Job {job_id} completed successfully. Processed {len(all_results)} products.")
 
-            # Create output file
-            output_filename = f"output_{job_id}.xlsx"
-            output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Job {job_id} failed: {error_msg}")
+        job.fail(error_msg)
 
-            # Create the actual output file
-            ExcelHandler.create_output_file(valid_results, output_path, job.original_data)
-
-            # Mark job as completed or stopped
-            if job.stop_requested:
-                job.stop(output_path)
-                logger.info(f"Job {job_id} stopped by user. Processed {len(valid_results)} products.")
-            else:
-                job.complete(output_path)
-                logger.info(f"Job {job_id} completed successfully. Processed {len(valid_results)} products.")
-
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Job {job_id} failed: {error_msg}")
-            job.fail(error_msg)
+    finally:
+        # Clean up uploaded file
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
 
 
-        finally:
-            # Clean up uploaded file
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception:
-                pass
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    """Handle file too large errors."""
+    return jsonify({'success': False, 'error': 'File too large. Maximum size is 50MB.'}), 413
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    """Handle internal server errors."""
+    logger.error(f"Internal server error: {str(error)}")
+    return jsonify({'success': False, 'error': 'Internal server error occurred.'}), 500
+
+
+@app.route('/validate_api', methods=['POST'])
+def validate_api():
+    """
+    Validate API key and check rate limits with real-time testing.
+    Returns status, rate limit info, and validation results.
+    """
+    try:
+        data = request.get_json()
+        api_key = data.get('api_key', '').strip()
+        model_type = data.get('model_type', 'mistral').lower()
+        
+        if not api_key:
+            return jsonify({
+                'success': False,
+                'status': 'invalid',
+                'message': 'API key is required',
+                'details': 'Please enter your API key'
+            })
+        
+        openrouter_models = ['mistral', 'openchat', 'deepseek', 'gptoss']
+        allowed_models = openrouter_models + ['gemini']
+        if model_type not in allowed_models:
+            return jsonify({
+                'success': False,
+                'status': 'invalid',
+                'message': 'Invalid model type',
+                'details': 'Supported models: Mistral, OpenChat, DeepSeek, GPT-OSS (OpenRouter) and Gemini.'
+            })
+        
+        # Test the API key with a simple request for supported models
+        validation_result = test_api_key(api_key, model_type)
+        
+        return jsonify(validation_result)
+        
+    except Exception as e:
+        logger.error(f"API validation error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'status': 'error',
+            'message': 'Validation failed',
+            'details': str(e)
+        })
 
 
 def test_api_key(api_key: str, model_type: str) -> dict:
