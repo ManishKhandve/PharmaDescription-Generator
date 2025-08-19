@@ -58,6 +58,7 @@ except Exception as e:
     logger.error(f"Critical error initializing Flask app: {str(e)}")
     raise
 
+
 # Global dictionary to track processing jobs with error handling
 try:
     processing_jobs = {}
@@ -65,6 +66,32 @@ try:
 except Exception as e:
     logger.error(f"Error initializing processing jobs: {str(e)}")
     processing_jobs = {}
+
+# Inactivity timer logic
+last_activity = time.time()
+INACTIVITY_TIMEOUT = 5 * 60  # 5 minutes
+
+def is_processing():
+    # Return True if any job is currently processing
+    for job in processing_jobs.values():
+        if job.status in ("processing", "initializing"):
+            return True
+    return False
+
+def update_activity():
+    global last_activity
+    last_activity = time.time()
+
+def inactivity_watcher():
+    while True:
+        time.sleep(10)
+        idle_time = time.time() - last_activity
+        logger.debug(f"[InactivityWatcher] is_processing={is_processing()} | idle_time={idle_time:.1f}s | timeout={INACTIVITY_TIMEOUT}s")
+        if not is_processing() and (idle_time > INACTIVITY_TIMEOUT):
+            logger.info("No activity for 5 minutes. Shutting down server...")
+            os._exit(0)
+
+threading.Thread(target=inactivity_watcher, daemon=True).start()
 
 
 class ProcessingJob:
@@ -114,6 +141,10 @@ class ProcessingJob:
         if output_file:
             self.output_file = output_file
 
+
+@app.before_request
+def before_request():
+    update_activity()
 
 @app.route('/')
 def index():
@@ -217,20 +248,21 @@ def get_progress(job_id):
     if job.start_time:
         elapsed = datetime.now() - job.start_time
         elapsed_seconds = int(elapsed.total_seconds())
-        if elapsed_seconds >= 60:
-            elapsed_time = f"{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
-        else:
-            elapsed_time = f"{elapsed_seconds}s"
+        # Always show elapsed time as H:M:S
+        elapsed_h = elapsed_seconds // 3600
+        elapsed_m = (elapsed_seconds % 3600) // 60
+        elapsed_s = elapsed_seconds % 60
+        elapsed_time = f"{elapsed_h}h {elapsed_m}m {elapsed_s}s"
 
         # Estimate time left if possible
         if job.processed_count and job.total_products and job.processed_count > 0:
             avg_time_per = elapsed_seconds / job.processed_count
             remaining = job.total_products - job.processed_count
             est_seconds = int(avg_time_per * remaining)
-            if est_seconds >= 60:
-                estimated_time = f"{est_seconds // 60}m {est_seconds % 60}s"
-            else:
-                estimated_time = f"{est_seconds}s"
+            est_h = est_seconds // 3600
+            est_m = (est_seconds % 3600) // 60
+            est_s = est_seconds % 60
+            estimated_time = f"{est_h}h {est_m}m {est_s}s"
         else:
             estimated_time = "Estimating..."
 
@@ -348,9 +380,10 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
         job.total_products = len(product_info_list)
         job.original_data = original_data  # Store original data in job
 
-        # Initialize LLM client and batch processor with reduced batch size for stability
-        llm_client = LLMClient(api_key, model_type)
-        processor = BatchProcessor(llm_client, batch_size=3)  # Reduced for large datasets
+
+    # Initialize LLM client and batch processor with increased batch size for more parallelism
+    llm_client = LLMClient(api_key, model_type)
+    processor = BatchProcessor(llm_client, batch_size=10)  # Increased for more parallelism
 
         # Enhanced progress callback function that handles failed count
         def progress_callback(progress_pct: int, processed: int, total: int, failed: int = 0):
@@ -369,123 +402,98 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
             return job.stop_requested
 
         # Run async processing
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+
         try:
-            results = loop.run_until_complete(
-                processor.process_products(product_info_list, progress_callback, stop_check)
-            )
+            logger.info(f"Starting processing job {job_id} with {model_type}")
+            job.status = "processing"
+
+            # Read products from Excel file and preserve original data
+            product_info_list, original_data = ExcelHandler.read_input_file(file_path)
+            job.total_products = len(product_info_list)
+            job.original_data = original_data  # Store original data in job
+
+            # Initialize LLM client and batch processor with increased batch size for more parallelism
+            llm_client = LLMClient(api_key, model_type)
+            processor = BatchProcessor(llm_client, batch_size=10)  # Increased for more parallelism
+
+            # Enhanced progress callback function that handles failed count
+            def progress_callback(progress_pct: int, processed: int, total: int, failed: int = 0):
+                if processed > 0 and len(processor.cache) > 0:
+                    # Get last processed product name
+                    last_result = list(processor.cache.values())[-1]
+                    current_product = last_result.get('product_name', 'Unknown')
+                    job.update_progress(processed, current_product)
+
+                    # Log progress for large datasets
+                    if total > 100 and processed % 50 == 0:  # Log every 50 products for large datasets
+                        logger.info(f"Progress: {processed}/{total} ({progress_pct}%) processed, {failed} failed")
+
+            # Stop check function
+            def stop_check():
+                return job.stop_requested
+
+            # Run async processing
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                results = loop.run_until_complete(
+                    processor.process_products(product_info_list, progress_callback, stop_check)
+                )
+            finally:
+                loop.close()
+
+            # Handle processing results
+            if not results:
+                if job.stop_requested:
+                    raise Exception("Processing stopped by user request with no results")
+                else:
+                    raise Exception("No results generated")
+
+            # Filter out exceptions from failed tasks
+            valid_results = []
+            for result in results:
+                if isinstance(result, dict):
+                    valid_results.append(result)
+                else:
+                    logger.warning(f"Skipping invalid result: {result}")
+
+            if not valid_results:
+                if job.stop_requested:
+                    raise Exception("Processing stopped by user request")
+                else:
+                    raise Exception("All processing tasks failed")
+
+            # Store results in job for later download
+            job.results = valid_results
+
+            # Create output file
+            output_filename = f"output_{job_id}.xlsx"
+            output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+
+            # Create the actual output file
+            ExcelHandler.create_output_file(valid_results, output_path, job.original_data)
+
+            # Mark job as completed or stopped
+            if job.stop_requested:
+                job.stop(output_path)
+                logger.info(f"Job {job_id} stopped by user. Processed {len(valid_results)} products.")
+            else:
+                job.complete(output_path)
+                logger.info(f"Job {job_id} completed successfully. Processed {len(valid_results)} products.")
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Job {job_id} failed: {error_msg}")
+            job.fail(error_msg)
+
+
         finally:
-            loop.close()
-
-        # Handle processing results
-        if not results:
-            if job.stop_requested:
-                raise Exception("Processing stopped by user request with no results")
-            else:
-                raise Exception("No results generated")
-
-        # Filter out exceptions from failed tasks
-        valid_results = []
-        for result in results:
-            if isinstance(result, dict):
-                valid_results.append(result)
-            else:
-                logger.warning(f"Skipping invalid result: {result}")
-
-        if not valid_results:
-            if job.stop_requested:
-                raise Exception("Processing stopped by user request")
-            else:
-                raise Exception("All processing tasks failed")
-
-        # Store results in job for later download
-        job.results = valid_results
-
-        # Create output file
-        output_filename = f"output_{job_id}.xlsx"
-        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-
-        # Create the actual output file
-        ExcelHandler.create_output_file(valid_results, output_path, job.original_data)
-
-        # Mark job as completed or stopped
-        if job.stop_requested:
-            job.stop(output_path)
-            logger.info(f"Job {job_id} stopped by user. Processed {len(valid_results)} products.")
-        else:
-            job.complete(output_path)
-            logger.info(f"Job {job_id} completed successfully. Processed {len(valid_results)} products.")
-
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Job {job_id} failed: {error_msg}")
-        job.fail(error_msg)
-
-    finally:
-        # Clean up uploaded file
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception:
-            pass
-
-
-@app.errorhandler(413)
-def request_entity_too_large(error):
-    """Handle file too large errors."""
-    return jsonify({'success': False, 'error': 'File too large. Maximum size is 50MB.'}), 413
-
-
-@app.errorhandler(500)
-def internal_server_error(error):
-    """Handle internal server errors."""
-    logger.error(f"Internal server error: {str(error)}")
-    return jsonify({'success': False, 'error': 'Internal server error occurred.'}), 500
-
-
-@app.route('/validate_api', methods=['POST'])
-def validate_api():
-    """
-    Validate API key and check rate limits with real-time testing.
-    Returns status, rate limit info, and validation results.
-    """
-    try:
-        data = request.get_json()
-        api_key = data.get('api_key', '').strip()
-        model_type = data.get('model_type', 'mistral').lower()
-        
-        if not api_key:
-            return jsonify({
-                'success': False,
-                'status': 'invalid',
-                'message': 'API key is required',
-                'details': 'Please enter your API key'
-            })
-        
-        openrouter_models = ['mistral', 'openchat', 'deepseek', 'gptoss']
-        allowed_models = openrouter_models + ['gemini']
-        if model_type not in allowed_models:
-            return jsonify({
-                'success': False,
-                'status': 'invalid',
-                'message': 'Invalid model type',
-                'details': 'Supported models: Mistral, OpenChat, DeepSeek, GPT-OSS (OpenRouter) and Gemini.'
-            })
-        
-        # Test the API key with a simple request for supported models
-        validation_result = test_api_key(api_key, model_type)
-        
-        return jsonify(validation_result)
-        
-    except Exception as e:
-        logger.error(f"API validation error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'status': 'error',
-            'message': 'Validation failed',
-            'details': str(e)
-        })
+            # Clean up uploaded file
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
 
 
 def test_api_key(api_key: str, model_type: str) -> dict:
@@ -668,7 +676,7 @@ if __name__ == '__main__':
     print("📁 Upload folder:", app.config['UPLOAD_FOLDER'])
     print("� Output: Direct download (no server storage)")
     print("📊 Max file size: 50MB")
-    print("🤖 Supported models: Mistral 7B (OpenRouter), Gemini 1.5 Flash")
+    print("🤖 Supported models: Mistral 7B (OpenRouter), OpenChat, DeepSeek, GPT-OSS (OpenRouter) , Gemini 1.5 Flash")
     print("="*60)
     print("🚀 Open your browser and navigate to: http://127.0.0.1:5000")
     print("="*60 + "\n")

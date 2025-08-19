@@ -1,6 +1,58 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <script>
+    // Inactivity timer for frontend notification (matches backend logic)
+    let lastUserActivity = Date.now();
+    let processing = false;
+    let inactivityAlertShown = false;
+
+    function resetInactivityTimer() {
+        lastUserActivity = Date.now();
+        if (inactivityAlertShown) {
+            hideInactivityAlert();
+        }
+    }
+
+    function setProcessingState(isProcessing) {
+        processing = isProcessing;
+        if (isProcessing && inactivityAlertShown) {
+            hideInactivityAlert();
+        }
+    }
+
+    function showInactivityAlert() {
+        let alertDiv = document.getElementById('inactivityAlert');
+        if (!alertDiv) {
+            alertDiv = document.createElement('div');
+            alertDiv.id = 'inactivityAlert';
+            alertDiv.className = 'alert alert-warning text-center';
+            alertDiv.innerHTML = '<i class="bi bi-exclamation-triangle me-2"></i>Server will shut down due to inactivity in less than 1 minute.';
+            document.body.prepend(alertDiv);
+        } else {
+            alertDiv.style.display = 'block';
+        }
+        inactivityAlertShown = true;
+    }
+
+    function hideInactivityAlert() {
+        let alertDiv = document.getElementById('inactivityAlert');
+        if (alertDiv) alertDiv.style.display = 'none';
+        inactivityAlertShown = false;
+    }
+
+    // Listen for user activity
+    ['mousemove', 'keydown', 'mousedown', 'touchstart'].forEach(evt => {
+        window.addEventListener(evt, resetInactivityTimer, true);
+    });
+
+    // Monitor inactivity (5 min = 300000 ms)
+    setInterval(() => {
+        if (!processing && (Date.now() - lastUserActivity > 4.5 * 60 * 1000)) {
+            showInactivityAlert();
+        }
+    }, 15000);
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pharmaceutical Description Generator</title>

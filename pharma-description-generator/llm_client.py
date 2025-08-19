@@ -568,6 +568,7 @@ class LLMClient:
                     f"Generate a SHORT DESCRIPTION for '{product_name}' with these exact requirements:\n\n"
                     f"✅ Short Description:\n"
                     f"• 4 concise small bullet points, no punctuation at the end\n\n"
+                     f"• Do NOT use numbers or numbering (like 1., 2., etc.) after the bullet points—just plain bullet points.\n\n"
                     f"⚠ Very Important: DO NOT change the format, tone, or style. Continue exactly as in previous descriptions generated.\n\n"
                     f"Format each bullet point as:\n"
                     f"• First benefit\n"

@@ -776,18 +776,13 @@ def estimate_processing_time(product_count: int, model_type: str) -> Dict[str, A
     
     estimated_seconds = (product_count * base_time) * batch_factor
     
-    # Convert to human-readable format
-    minutes = int(estimated_seconds // 60)
-    hours = minutes // 60
-    minutes = minutes % 60
-    
-    time_str = ""
-    if hours > 0:
-        time_str = f"{hours}h {minutes}m"
-    elif minutes > 0:
-        time_str = f"{minutes}m"
-    else:
-        time_str = f"{int(estimated_seconds)}s"
+    # Convert to human-readable format (always show h, m, s)
+    total_seconds = int(estimated_seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    time_str = f"{hours}h {minutes}m {seconds}s"
     
     return {
         'estimated_seconds': estimated_seconds,
