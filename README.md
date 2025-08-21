@@ -98,8 +98,8 @@ Vitamin D3 1000 IU Softgels
 
 **Mistral AI:**
 
-* [https://console.mistral.ai](https://console.mistral.ai) → Generate key
-* Select **Mistral Small**
+*https://openrouter.ai/mistralai/mistral-7b-instruct:free → Generate key
+* Select **Mistral7B**
 
 **Google Gemini:**
 
@@ -174,18 +174,6 @@ Vitamin D3 1000 IU Softgels
 ```bash
 pip install gunicorn
 gunicorn -w 4 -b 0.0.0.0:5000 app:app
-```
-
-**Dockerfile:**
-
-```dockerfile
-FROM python:3.9-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-EXPOSE 5000
-CMD ["python", "app.py"]
 ```
 
 **Environment:**
