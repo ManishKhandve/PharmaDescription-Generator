@@ -411,10 +411,34 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
         # Helper to check which products are missing descriptions
         def get_missing_products(product_info_list, results):
             described_names = set()
+            failed_products = []
+            empty_descriptions = []
+            
             for r in results:
-                if isinstance(r, dict) and r.get('description') and r.get('product_name'):
-                    described_names.add(r['product_name'])
+                if isinstance(r, dict) and r.get('product_name'):
+                    # Check if product has at least one description (short or long) AND is not explicitly failed
+                    has_short = r.get('short_description', '').strip()
+                    has_long = r.get('long_description', '').strip()
+                    is_failed = r.get('status') == 'failed'
+                    
+                    if (has_short or has_long) and not is_failed:
+                        described_names.add(r['product_name'])
+                    elif is_failed:
+                        failed_products.append(r['product_name'])
+                    elif not has_short and not has_long:
+                        empty_descriptions.append(r['product_name'])
+            
             missing = [p for p in product_info_list if p.get('product_name') not in described_names]
+            
+            # Debug logging
+            if failed_products:
+                logger.debug(f"Products with failed status: {failed_products[:5]}")
+            if empty_descriptions:
+                logger.debug(f"Products with empty descriptions: {empty_descriptions[:5]}")
+            if missing:
+                missing_names = [p.get('product_name', 'Unknown') for p in missing[:5]]
+                logger.debug(f"Products completely missing from results: {missing_names}")
+            
             return missing
 
         # Handle processing results
@@ -427,44 +451,300 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
 
         # Filter out exceptions from failed tasks
         valid_results = []
+        invalid_count = 0
         for result in results:
             if isinstance(result, dict):
                 valid_results.append(result)
             else:
+                invalid_count += 1
                 logger.warning(f"Skipping invalid result: {result}")
+        
+        logger.info(f"Initial results: {len(results)} total, {len(valid_results)} valid, {invalid_count} invalid")
+        
+        # Debug: Check what we have in the valid results
+        if valid_results:
+            sample_result = valid_results[0]
+            logger.debug(f"Sample result structure: {list(sample_result.keys())}")
+            logger.debug(f"Sample result: {sample_result}")
+        
+        # Debug: Check initial missing count before retries
+        initial_missing = get_missing_products(product_info_list, valid_results)
+        logger.info(f"Before retries: {len(initial_missing)} products missing descriptions out of {len(product_info_list)} total")
 
 
         # Improved retry for missing products: always retry all missing in each round, robust merging, and log after each retry
-        max_retries = 5
+        max_retries = 7
         retry_count = 0
         all_results = valid_results[:]
+        previous_missing_count = -1
+        stagnant_retries = 0
+        
         while retry_count < max_retries:
             missing_products = get_missing_products(product_info_list, all_results)
             logger.warning(f"[Retry {retry_count+1}] {len(missing_products)} products missing descriptions.")
+            
+            # Check if we're making progress
+            if len(missing_products) == previous_missing_count:
+                stagnant_retries += 1
+                logger.warning(f"No progress made in retry {retry_count+1} (stagnant count: {stagnant_retries})")
+                if stagnant_retries >= 2:  # If no progress for 2 consecutive retries, stop
+                    logger.error(f"Breaking retry loop: No progress after {stagnant_retries} consecutive attempts")
+                    break
+            else:
+                stagnant_retries = 0  # Reset stagnant counter
+                
+            previous_missing_count = len(missing_products)
+            
+            # Log some missing product names for debugging
+            if missing_products:
+                missing_sample = [p.get('product_name', 'Unknown') for p in missing_products[:5]]
+                logger.info(f"Sample missing products: {missing_sample}")
+            
             if not missing_products or job.stop_requested:
+                logger.info(f"✅ Retry loop completed: No more missing products after {retry_count} retries")
                 break
+                
             # Re-process all missing products
+            logger.info(f"Retrying {len(missing_products)} missing products...")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
+                # Create a fresh processor for retries to avoid cache issues
+                retry_processor = BatchProcessor(llm_client, batch_size=min(3, len(missing_products)))
                 retry_results = loop.run_until_complete(
-                    processor.process_products(missing_products, progress_callback, stop_check)
+                    retry_processor.process_products(missing_products, progress_callback, stop_check)
                 )
+                logger.info(f"Retry produced {len(retry_results)} results")
+                
+                # Log details of retry results
+                successful_retries = 0
+                failed_retries = 0
+                for r in retry_results:
+                    if isinstance(r, dict):
+                        if r.get('short_description', '').strip() or r.get('long_description', '').strip():
+                            successful_retries += 1
+                        else:
+                            failed_retries += 1
+                            logger.warning(f"Retry failed for {r.get('product_name', 'unknown')}: empty descriptions")
+                    else:
+                        failed_retries += 1
+                        logger.warning(f"Invalid retry result: {r}")
+                        
+                logger.info(f"Retry breakdown: {successful_retries} successful, {failed_retries} failed")
+                
+            except Exception as e:
+                logger.error(f"Retry processing failed: {str(e)}")
+                retry_results = []
             finally:
                 loop.close()
-            # Merge: always keep only the latest result for each product_name
-            result_map = {r['product_name']: r for r in all_results if isinstance(r, dict) and r.get('product_name')}
-            for r in retry_results:
+                
+            # Debug: Check retry results
+            valid_retry_results = [r for r in retry_results if isinstance(r, dict)]
+            logger.info(f"Valid retry results: {len(valid_retry_results)}")
+            
+            # Merge: always keep only the latest result for each product_name, but prioritize results with descriptions
+            result_map = {}
+            
+            # First, add all existing results
+            for r in all_results:
                 if isinstance(r, dict) and r.get('product_name'):
                     result_map[r['product_name']] = r
+            
+            logger.info(f"Current result_map has {len(result_map)} products")
+            
+            # Then, merge retry results - prioritize ones with actual descriptions
+            retry_additions = 0
+            retry_updates = 0
+            for r in retry_results:
+                if isinstance(r, dict) and r.get('product_name'):
+                    product_name = r['product_name']
+                    has_descriptions = r.get('short_description', '').strip() or r.get('long_description', '').strip()
+                    
+                    if product_name in result_map:
+                        # Update existing result if the retry has descriptions or the existing one doesn't
+                        existing_has_desc = (result_map[product_name].get('short_description', '').strip() or 
+                                            result_map[product_name].get('long_description', '').strip())
+                        if has_descriptions or not existing_has_desc:
+                            result_map[product_name] = r
+                            retry_updates += 1
+                            if has_descriptions:
+                                logger.debug(f"Updated {product_name} with retry result (has descriptions)")
+                    else:
+                        # New result
+                        result_map[product_name] = r
+                        retry_additions += 1
+            
+            logger.info(f"Retry merge: {retry_additions} new products, {retry_updates} updates")
+            
             all_results = list(result_map.values())
+            logger.info(f"After merge: {len(all_results)} total results")
             retry_count += 1
-        # Final check for missing
+
+        # Targeted partial retries for missing short or long descriptions separately (batched by 10)
+        product_meta_map = {p.get('product_name'): p for p in product_info_list if p.get('product_name')}
+
+        def _classify_partial_results(results_list):
+            missing_short = []
+            missing_long = []
+            for entry in results_list:
+                if not isinstance(entry, dict):
+                    continue
+                pname = entry.get('product_name')
+                if not pname:
+                    continue
+                short_desc = str(entry.get('short_description', '')).strip()
+                long_desc = str(entry.get('long_description', '')).strip()
+                status = entry.get('status')
+
+                if short_desc and long_desc and status != 'failed':
+                    continue
+
+                if not short_desc:
+                    missing_short.append(entry)
+                if not long_desc:
+                    missing_long.append(entry)
+
+            return missing_short, missing_long
+
+        async def _regenerate_descriptions_batched(entries, description_type: str, batch_size: int = 10):
+            results = [None] * len(entries)
+            async def _run_batch(batch_entries, start_index):
+                tasks = []
+                index_map = []
+                for idx, item in enumerate(batch_entries):
+                    pname = item.get('product_name')
+                    if not pname:
+                        continue
+                    meta = product_meta_map.get(pname, {})
+                    category = meta.get('category') if isinstance(meta, dict) else None
+                    tasks.append(llm_client.generate_description(pname, description_type, category))
+                    index_map.append(start_index + idx)
+                if not tasks:
+                    return
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for idx, res in zip(index_map, batch_results):
+                    results[idx] = res
+
+            for start in range(0, len(entries), batch_size):
+                batch_entries = entries[start:start + batch_size]
+                await _run_batch(batch_entries, start)
+
+            return results
+
+        missing_short_entries, missing_long_entries = _classify_partial_results(all_results)
+
+        if missing_short_entries:
+            logger.info(f"Attempting targeted batch retry for {len(missing_short_entries)} products missing short descriptions")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                short_retry_results = loop.run_until_complete(_regenerate_descriptions_batched(missing_short_entries, 'short'))
+            finally:
+                loop.close()
+            successes = 0
+            for entry, new_desc in zip(missing_short_entries, short_retry_results):
+                pname = entry.get('product_name', 'Unknown')
+                if isinstance(new_desc, Exception):
+                    logger.debug(f"Short description batch retry failed for {pname}: {str(new_desc)}")
+                    continue
+                if new_desc is None or not str(new_desc).strip():
+                    logger.debug(f"Short description batch retry returned empty result for {pname}")
+                    continue
+                cleaned = llm_client._clean_response(str(new_desc)) if hasattr(llm_client, '_clean_response') else str(new_desc)
+                formatted = llm_client._format_short_description_safely(cleaned, pname) if hasattr(llm_client, '_format_short_description_safely') else cleaned.strip()
+                if not formatted.strip():
+                    logger.debug(f"Short description batch retry produced empty formatted output for {pname}")
+                    continue
+                entry['short_description'] = formatted.strip()
+                successes += 1
+                if entry.get('long_description', '').strip():
+                    entry['status'] = 'success'
+                else:
+                    entry['status'] = 'partial'
+            logger.info(f"Short description batch retry filled {successes}/{len(missing_short_entries)} products")
+
+        if missing_long_entries:
+            logger.info(f"Attempting targeted batch retry for {len(missing_long_entries)} products missing long descriptions")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                long_retry_results = loop.run_until_complete(_regenerate_descriptions_batched(missing_long_entries, 'long'))
+            finally:
+                loop.close()
+            successes = 0
+            for entry, new_desc in zip(missing_long_entries, long_retry_results):
+                pname = entry.get('product_name', 'Unknown')
+                if isinstance(new_desc, Exception):
+                    logger.debug(f"Long description batch retry failed for {pname}: {str(new_desc)}")
+                    continue
+                if new_desc is None or not str(new_desc).strip():
+                    logger.debug(f"Long description batch retry returned empty result for {pname}")
+                    continue
+                cleaned = llm_client._clean_response(str(new_desc)) if hasattr(llm_client, '_clean_response') else str(new_desc)
+                formatted = llm_client._format_long_description_safely(cleaned, pname) if hasattr(llm_client, '_format_long_description_safely') else cleaned.strip()
+                if not formatted.strip():
+                    logger.debug(f"Long description batch retry produced empty formatted output for {pname}")
+                    continue
+                entry['long_description'] = formatted.strip()
+                successes += 1
+                if entry.get('short_description', '').strip():
+                    entry['status'] = 'success'
+                else:
+                    entry['status'] = 'partial'
+            logger.info(f"Long description batch retry filled {successes}/{len(missing_long_entries)} products")
+
+        # Final check for missing with comprehensive analysis
         missing_products = get_missing_products(product_info_list, all_results)
         if missing_products and not job.stop_requested:
+            missing_names = [p.get('product_name', 'Unknown') for p in missing_products[:10]]  # Show first 10
             logger.error(f"After {max_retries} retries, {len(missing_products)} products still missing descriptions.")
+            logger.error(f"First few missing products: {missing_names}")
+            
+            # Comprehensive analysis of why products are missing
+            logger.info("=== MISSING PRODUCTS ANALYSIS ===")
+            logger.info(f"Total input products: {len(product_info_list)}")
+            logger.info(f"Total results generated: {len(all_results)}")
+            
+            # Check what happened to the first few missing products
+            for i, missing_product in enumerate(missing_products[:5]):  # Check first 5 missing
+                product_name = missing_product.get('product_name', '')
+                logger.info(f"\n--- Missing Product #{i+1}: '{product_name}' ---")
+                
+                # Check if there's any result for this product name
+                matching_results = [r for r in all_results if isinstance(r, dict) and r.get('product_name') == product_name]
+                if matching_results:
+                    result = matching_results[0]
+                    short_desc = result.get('short_description', '').strip()
+                    long_desc = result.get('long_description', '').strip()
+                    status = result.get('status', 'unknown')
+                    error = result.get('error', 'none')
+                    
+                    logger.info(f"  - Result exists with status: {status}")
+                    logger.info(f"  - Short description length: {len(short_desc)}")
+                    logger.info(f"  - Long description length: {len(long_desc)}")
+                    logger.info(f"  - Error: {error}")
+                    if short_desc:
+                        logger.info(f"  - Short desc preview: '{short_desc[:50]}...'")
+                    if long_desc:
+                        logger.info(f"  - Long desc preview: '{long_desc[:50]}...'")
+                else:
+                    logger.info(f"  - NO RESULT FOUND for this product")
+                    
+                # Check for similar product names (fuzzy matching)
+                similar_results = []
+                product_name_lower = product_name.lower().replace(' ', '').replace('-', '').replace('_', '')
+                for r in all_results:
+                    if isinstance(r, dict) and r.get('product_name'):
+                        r_name_lower = r['product_name'].lower().replace(' ', '').replace('-', '').replace('_', '')
+                        if product_name_lower in r_name_lower or r_name_lower in product_name_lower:
+                            similar_results.append(r['product_name'])
+                            
+                if similar_results:
+                    logger.info(f"  - Similar names found: {similar_results[:3]}")
+                else:
+                    logger.info(f"  - No similar names found")
         else:
-            logger.info(f"All products processed after {retry_count} retries.")
+            logger.info(f"✅ All products processed successfully after {retry_count} retries.")
 
         # Store results in job for later download
         job.results = all_results

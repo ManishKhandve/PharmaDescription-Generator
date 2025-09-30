@@ -53,11 +53,11 @@ class ExcelHandler:
             
             # Read Excel file with all data
             try:
-                df = pd.read_excel(file_path, engine='openpyxl')
+                df = pd.read_excel(file_path, header=0, engine='openpyxl')
             except Exception as e:
                 # Fallback to xlrd for older files
                 try:
-                    df = pd.read_excel(file_path, engine='xlrd')
+                    df = pd.read_excel(file_path, header=0, engine='xlrd')
                 except Exception as e2:
                     raise Exception(f"Could not read Excel file with any engine. openpyxl error: {str(e)}, xlrd error: {str(e2)}")
             
@@ -97,6 +97,25 @@ class ExcelHandler:
 
             if not product_info:
                 raise ValueError("No valid product names found in first column")
+
+            # Remove any existing description columns from the original DataFrame to avoid conflicts
+            # This ensures we generate fresh descriptions regardless of pre-existing ones
+            description_keywords = [
+                'description', 'short description', 'long description', 'short_description', 'long_description',
+                'desc', 'short desc', 'long desc', 'product description', 'item description',
+                'details', 'product details', 'summary', 'overview'
+            ]
+            
+            columns_to_remove = []
+            for col in df.columns:
+                col_name_lower = str(col).strip().lower()
+                if any(keyword in col_name_lower for keyword in description_keywords):
+                    columns_to_remove.append(col)
+                    logger.info(f"Ignoring existing description column: '{col}'")
+            
+            if columns_to_remove:
+                df = df.drop(columns=columns_to_remove)
+                logger.info(f"Removed {len(columns_to_remove)} existing description columns")
 
             logger.info(f"Successfully read {len(product_info)} products from {file_path}")
             return product_info, df
@@ -160,24 +179,33 @@ class ExcelHandler:
                             short_desc = result.get('short_description', '')
                             long_desc = result.get('long_description', '')
                             
-                            # Clean descriptions and ensure proper circle bullets
+                            # Clean descriptions and format short description with HTML
                             if short_desc:
                                 short_desc = str(short_desc).replace('*', '').replace('_', '').strip()
-                                # Convert any remaining asterisk bullets to circle bullets
+                                # Convert to HTML format with proper bullet points
                                 lines = short_desc.split('\n')
-                                bullet_lines = []
+                                html_lines = []
                                 for line in lines:
                                     try:
                                         line = str(line).strip()
                                         if line.startswith('*'):
-                                            line = '•' + line[1:]
+                                            line = line[1:].strip()
                                         elif line.startswith('- '):
-                                            line = '• ' + line[2:]
-                                        bullet_lines.append(line)
+                                            line = line[2:].strip()
+                                        elif line.startswith('• '):
+                                            line = line[2:].strip()
+                                        
+                                        if line:  # Only add non-empty lines
+                                            html_lines.append(f"<li>{line}</li>")
                                     except Exception as e:
                                         logger.warning(f"Error processing bullet line: {str(e)}")
-                                        bullet_lines.append(str(line).replace('*', ''))
-                                short_desc = '\n'.join(bullet_lines)
+                                        if line:
+                                            html_lines.append(f"<li>{str(line).replace('*', '').strip()}</li>")
+                                
+                                if html_lines:
+                                    short_desc = f"<ul>{''.join(html_lines)}</ul>"
+                                else:
+                                    short_desc = short_desc  # Keep original if no bullet points found
                             
                             if long_desc:
                                 long_desc = str(long_desc).replace('*', '').replace('_', '').strip()
@@ -312,13 +340,17 @@ class ExcelHandler:
                     # Create enhanced output with original data preserved
                     output_df = original_data.copy()
                     
-                    # Create a mapping of product names to results for faster lookup
+                    # Create a mapping of product names to results for faster lookup with fuzzy matching
                     results_map = {}
+                    results_map_normalized = {}
                     for result in results:
                         try:
                             product_name = str(result.get('product_name', '')).strip()
                             if product_name:
                                 results_map[product_name] = result
+                                # Create normalized version for fuzzy matching
+                                normalized_name = product_name.lower().replace(' ', '').replace('-', '').replace('_', '')
+                                results_map_normalized[normalized_name] = result
                         except Exception as e:
                             logger.warning(f"Error processing result mapping: {str(e)}")
                     
@@ -336,29 +368,57 @@ class ExcelHandler:
                     for idx, row in output_df.iterrows():
                         try:
                             product_name = str(row.iloc[0]).strip() if len(row) > 0 else ''
+                            
+                            # Try exact match first
                             result = results_map.get(product_name, {})
+                            
+                            # If no exact match, try fuzzy matching
+                            if not result and product_name:
+                                normalized_input = product_name.lower().replace(' ', '').replace('-', '').replace('_', '')
+                                result = results_map_normalized.get(normalized_input, {})
+                                
+                                # If still no match, try partial matching
+                                if not result:
+                                    for norm_key, norm_result in results_map_normalized.items():
+                                        if norm_key in normalized_input or normalized_input in norm_key:
+                                            result = norm_result
+                                            logger.info(f"Found partial match for '{product_name}' -> '{norm_result.get('product_name', '')}'")
+                                            break
+                            
+                            # If no result found, log the missing entry
+                            if not result and product_name:
+                                logger.warning(f"No description found for product: '{product_name}'")
                             
                             short_desc = result.get('short_description', '')
                             long_desc = result.get('long_description', '')
                             
-                            # Clean descriptions and ensure proper circle bullets
+                            # Clean descriptions and format short description with HTML
                             if short_desc:
                                 short_desc = str(short_desc).replace('*', '').replace('_', '').strip()
-                                # Convert any remaining asterisk bullets to circle bullets
+                                # Convert to HTML format with proper bullet points
                                 lines = short_desc.split('\n')
-                                bullet_lines = []
+                                html_lines = []
                                 for line in lines:
                                     try:
                                         line = str(line).strip()
                                         if line.startswith('*'):
-                                            line = '•' + line[1:]
+                                            line = line[1:].strip()
                                         elif line.startswith('- '):
-                                            line = '• ' + line[2:]
-                                        bullet_lines.append(line)
+                                            line = line[2:].strip()
+                                        elif line.startswith('• '):
+                                            line = line[2:].strip()
+                                        
+                                        if line:  # Only add non-empty lines
+                                            html_lines.append(f"<li>{line}</li>")
                                     except Exception as e:
                                         logger.warning(f"Error processing bullet line: {str(e)}")
-                                        bullet_lines.append(str(line).replace('*', ''))
-                                short_desc = '\n'.join(bullet_lines)
+                                        if line:
+                                            html_lines.append(f"<li>{str(line).replace('*', '').strip()}</li>")
+                                
+                                if html_lines:
+                                    short_desc = f"<ul>{''.join(html_lines)}</ul>"
+                                else:
+                                    short_desc = short_desc  # Keep original if no bullet points found
                             
                             if long_desc:
                                 long_desc = str(long_desc).replace('*', '').replace('_', '').strip()
@@ -625,10 +685,6 @@ class ProgressTracker:
             self.total_count = 0
             self.processed_count = 0
             self.results = []
-        self.total_count = total_products
-        self.processed_count = 0
-        self.results = []
-        logger.info(f"Initialized progress tracking for {total_products} products")
     
     def update_progress(self, new_results: List[Dict[str, Any]]):
         """

@@ -780,16 +780,34 @@ class BatchProcessor:
             
             batch_results = await self._process_batch_with_retry(batch)
             
-            # Separate successful and failed results
+            # Separate successful and failed results with better logging
+            batch_successful = 0
+            batch_failed = 0
             for result in batch_results:
-                if isinstance(result, Exception):
-                    failed_products.append(f"Exception: {str(result)}")
+                if not isinstance(result, dict):
+                    batch_failed += 1
+                    logger.warning(f"Unexpected result type encountered: {type(result)}")
                     continue
-                    
+
+                original_product = result.pop('original_product', None)
+                product_name = result.get('product_name', 'Unknown')
+
                 if result.get('status') == 'failed':
-                    failed_products.append(result['product_name'])
+                    batch_failed += 1
+                    logger.debug(f"Product failed: {product_name} - {result.get('error', 'Unknown error')}")
+
+                    if original_product:
+                        failed_products.append(original_product)
+                    else:
+                        failed_products.append({'product_name': product_name})
+
+                    # Ensure failed results are still tracked for downstream processing
+                    results.append(result)
                 else:
                     results.append(result)
+                    batch_successful += 1
+            
+            logger.info(f"Batch {i//self.batch_size + 1} completed: {batch_successful} successful, {batch_failed} failed")
             
             # Update progress with detailed info
             if progress_callback:
@@ -811,7 +829,9 @@ class BatchProcessor:
             retry_results = await self._retry_failed_products_fast(failed_products[:10], stop_check)
             results.extend(retry_results)
         
-        logger.info(f"Batch processing complete: {len(results)} successful, {len(failed_products)} failed")
+        total_success = sum(1 for r in results if isinstance(r, dict) and r.get('status') != 'failed')
+        total_failed = sum(1 for r in results if isinstance(r, dict) and r.get('status') == 'failed')
+        logger.info(f"Batch processing complete: {total_success} successful, {total_failed} failed")
         return results
         
     def _calculate_delay(self, failed_count: int, success_count: int) -> float:
@@ -832,7 +852,7 @@ class BatchProcessor:
         Fast retry for critically failed products with minimal overhead.
         
         Args:
-            failed_products (list): List of failed product names
+            failed_products (list): List of failed product dictionaries
             stop_check (callable): Function to check for stop request
             
         Returns:
@@ -853,7 +873,8 @@ class BatchProcessor:
                 retry_results.append(result)
                 
             except Exception as e:
-                logger.debug(f"Retry failed for {product}: {str(e)}")
+                product_name = product.get('product_name', 'Unknown') if isinstance(product, dict) else str(product)
+                logger.debug(f"Retry failed for {product_name}: {str(e)}")
                 # Don't add failed retries to avoid duplicates
                 continue
                 
@@ -880,7 +901,9 @@ class BatchProcessor:
             # product is a dict: {"product_name": ..., "category": ...}
             cache_key = product["product_name"].lower().strip()
             if cache_key in self.cache:
-                batch_results.append(self.cache[cache_key])
+                cached_result = dict(self.cache[cache_key])
+                cached_result['original_product'] = product
+                batch_results.append(cached_result)
                 continue
 
             # Create task for this product
@@ -902,29 +925,48 @@ class BatchProcessor:
                         result = task_results[i]
                         if isinstance(result, Exception):
                             # Handle failed products
-                            result = {
+                            result_dict = {
                                 'product_name': product.get('product_name', str(product)),
                                 'short_description': '',
                                 'long_description': '',
                                 'status': 'failed',
                                 'error': str(result)
                             }
+                        elif isinstance(result, dict):
+                            result_dict = dict(result)
                         else:
-                            # Cache successful results
-                            cache_key = product.get('product_name', str(product)).lower().strip()
-                            self.cache[cache_key] = result
-                        batch_results.append(result)
+                            result_dict = {
+                                'product_name': product.get('product_name', str(product)),
+                                'short_description': '',
+                                'long_description': '',
+                                'status': 'failed',
+                                'error': f"Unexpected result type: {type(result)}"
+                            }
+
+                        # Cache successful results without original metadata
+                        if result_dict.get('status', 'success') != 'failed':
+                            cache_key_product = product.get('product_name', str(product)).lower().strip()
+                            self.cache[cache_key_product] = {
+                                'product_name': result_dict.get('product_name', product.get('product_name', str(product))),
+                                'short_description': result_dict.get('short_description', ''),
+                                'long_description': result_dict.get('long_description', ''),
+                                'status': result_dict.get('status', 'success')
+                            }
+
+                        result_dict['original_product'] = product
+                        batch_results.append(result_dict)
                 
             except asyncio.TimeoutError:
                 logger.warning(f"Batch timeout for {len(tasks)} products, creating empty results")
                 # Create failed results for timeout
                 for product, _ in tasks:
                     batch_results.append({
-                        'product_name': product,
+                        'product_name': product.get('product_name', str(product)),
                         'short_description': '',
                         'long_description': '',
                         'status': 'failed',
-                        'error': 'Timeout'
+                        'error': 'Timeout',
+                        'original_product': product
                     })
         
         return batch_results
@@ -940,8 +982,20 @@ class BatchProcessor:
             dict: Product information with generated descriptions
         """
         try:
-            product_name = product_info.get("product_name", "")
+            product_name = product_info.get("product_name", "").strip()
             category = product_info.get("category", None)
+            
+            # Skip empty product names
+            if not product_name:
+                logger.warning("Empty product name encountered, skipping")
+                return {
+                    'product_name': '',
+                    'short_description': '',
+                    'long_description': '',
+                    'status': 'failed',
+                    'error': 'Empty product name'
+                }
+            
             # Generate both descriptions concurrently for speed
             short_task = self.llm_client.generate_description(product_name, 'short', category)
             long_task = self.llm_client.generate_description(product_name, 'long', category)
