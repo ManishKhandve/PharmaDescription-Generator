@@ -96,7 +96,7 @@ class LLMClient:
             
             # Configure generation settings for optimal speed and accuracy balance
             generation_config = genai.types.GenerationConfig(
-                temperature=0.02,       # Slightly reduced for better accuracy
+                temperature=0.15,       # Slightly reduced for better accuracy
                 top_p=0.85,            # Optimized for speed while maintaining quality
                 top_k=40,              # Balanced for speed and vocabulary coverage
                 max_output_tokens=800, # Reduced for faster generation
@@ -138,6 +138,13 @@ class LLMClient:
             
             # SUPER AGGRESSIVE ASTERISK REMOVAL - Remove ALL asterisks first (including unicode variants)
             text = str(text).replace('*', '').replace('＊', '').replace('﹡', '').replace('∗', '')
+
+            # Remove common bracketed markers or instruction tokens that some models emit
+            for marker in (
+                '[OUT]', '[/OUT]', '[IN]', '[/IN]', '[INST]', '[/INST]',
+                '[BINST]', '[/BINST]', '<OUT>', '</OUT>', '<INST>', '</INST>'
+            ):
+                text = text.replace(marker, '')
             
             # Now process line by line for bullet conversion
             lines = text.split('\n')
@@ -233,7 +240,8 @@ class LLMClient:
                 logger.error("Empty product name after cleaning")
                 return ""
             
-            prompt = self._get_prompt(product_name, description_type, category)
+            metadata = self._extract_product_metadata(product_name, category)
+            prompt = self._get_prompt(product_name, description_type, category, metadata)
             if not prompt:
                 logger.error(f"Failed to generate prompt for {product_name}")
                 return ""
@@ -522,13 +530,86 @@ class LLMClient:
             if '*' in description or '＊' in description or '﹡' in description or '∗' in description:
                 logger.warning('Asterisk detected in cleaned text! Forcing removal.')
                 description = description.replace('*', '').replace('＊', '').replace('﹡', '').replace('∗', '')
+            description = self._truncate_long_description(description)
             return description.strip()
             
         except Exception as e:
             logger.error(f"Error in long description formatting: {str(e)}")
             return str(description).replace('*', '').strip()
+
+    def _truncate_long_description(self, description: str, max_sentences: int = 6, max_chars: int = 850) -> str:
+        """Trim long descriptions to prevent truncation by the LLM or downstream storage."""
+        try:
+            import re
+
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', description) if s.strip()]
+            truncated = sentences[:max_sentences]
+            text = ' '.join(truncated)
+
+            while len(text) > max_chars and truncated:
+                truncated = truncated[:-1]
+                text = ' '.join(truncated)
+
+            if text:
+                return text.strip()
+
+            return description[:max_chars].strip()
+
+        except Exception as e:
+            logger.warning(f"Error truncating long description: {str(e)}")
+            return description[:max_chars].strip() if len(description) > max_chars else description
     
-    def _get_prompt(self, product_name: str, description_type: str, category: str = None) -> str:
+    def _extract_product_metadata(self, product_name: str, category: Optional[str] = None) -> Dict[str, str]:
+        """Extract lightweight metadata from the product name to enrich prompts."""
+        metadata: Dict[str, str] = {}
+        try:
+            import re
+
+            name = product_name or ""
+
+            # Detect strength values (e.g., 500mg, 0.5 ml)
+            strength_match = re.search(
+                r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|kg|ml|l|iu|units|%|mcg)\b",
+                name,
+                flags=re.IGNORECASE,
+            )
+            if strength_match:
+                metadata['strength'] = strength_match.group().upper()
+
+            # Detect dosage form keywords
+            form_keywords = [
+                'Tablet', 'Tablets', 'Capsule', 'Capsules', 'Syrup', 'Injection', 'Solution',
+                'Cream', 'Gel', 'Ointment', 'Drops', 'Inhaler', 'Powder', 'Suspension',
+                'Lotion', 'Patch', 'Granules', 'Vial', 'Ampoule', 'Suppository', 'Spray'
+            ]
+            lower_name = name.lower()
+            for keyword in form_keywords:
+                if keyword.lower() in lower_name:
+                    metadata['form'] = keyword
+                    break
+
+            # Detect pack size indicators (e.g., Pack of 6, 10 Capsules, 6'S)
+            pack_patterns = [
+                r"\bpack\s*of\s*\d+\b",
+                r"\bset\s*of\s*\d+\b",
+                r"\b\d+\s*(?:tablets|capsules|sachets|ampoules|vials|strips|bottles|pieces)\b",
+                r"\b\d+['’`]?s\b",
+            ]
+            for pattern in pack_patterns:
+                match = re.search(pattern, name, flags=re.IGNORECASE)
+                if match:
+                    metadata['pack_size'] = match.group()
+                    break
+
+            if category:
+                metadata['category'] = str(category).strip()
+
+        except Exception as e:
+            logger.debug(f"Metadata extraction failed for {product_name}: {str(e)}")
+
+        return metadata
+
+    def _get_prompt(self, product_name: str, description_type: str, category: str = None, metadata: Optional[Dict[str, str]] = None) -> str:
         """
         Generate standardized product descriptions for e-commerce pharmaceutical platform.
         
@@ -547,7 +628,11 @@ class LLMClient:
             product_name = str(product_name).strip()
             if not product_name:
                 return ""
-            
+
+            metadata = metadata or {}
+            if category and 'category' not in metadata and category:
+                metadata['category'] = str(category).strip()
+
             # Compose strict context for both descriptions
             base_context = (
                 f"Important: The short description and long description must ALWAYS describe the SAME medicine.\n"
@@ -558,8 +643,23 @@ class LLMClient:
                 f"Both the short and long descriptions must highlight the same primary uses/indications of the medicine. Do not emphasize one condition or use in the long description if the short description gives equal weight to multiple uses (e.g., allergies and other symptoms). Maintain consistency in the main therapeutic focus between both descriptions.\n"
                 f"If uncertain, keep the description general but consistent across both short and long versions.\n"
             )
-            if category:
-                base_context += f"\nCategory: {category}\nUse the category only if it is relevant to the product's therapeutic use or context.\n"
+
+            detail_lines = []
+            if metadata.get('strength'):
+                detail_lines.append(f"- Strength: {metadata['strength']}")
+            if metadata.get('form'):
+                detail_lines.append(f"- Dosage form: {metadata['form']}")
+            if metadata.get('pack_size'):
+                detail_lines.append(f"- Pack size: {metadata['pack_size']}")
+            if metadata.get('category'):
+                detail_lines.append(f"- Therapeutic category: {metadata['category']}")
+
+            if detail_lines:
+                base_context += (
+                    "\nProduct-specific facts (mention each of these explicitly):\n"
+                    + "\n".join(detail_lines)
+                    + "\nAlways weave these facts into the narrative without inventing new data.\n"
+                )
 
             if description_type == 'short':
                 return (
@@ -567,8 +667,10 @@ class LLMClient:
                     f"You are helping me generate standardized product descriptions for an e-commerce platform selling pharmaceutical and healthcare products.\n\n"
                     f"Generate a SHORT DESCRIPTION for '{product_name}' with these exact requirements:\n\n"
                     f"✅ Short Description:\n"
-                    f"• 4 concise small bullet points, no punctuation at the end\n\n"
-                     f"• Do NOT use numbers or numbering (like 1., 2., etc.) after the bullet points—just plain bullet points.\n\n"
+                    f"• 4 concise bullet points, no trailing punctuation\n\n"
+                    f"• First bullet must mention {product_name}\n"
+                    f"• Mention every fact listed above (strength, dosage form, pack size, category when available)\n"
+                    f"• Do NOT use numbers or numbering (like 1., 2., etc.) after the bullet points—just plain bullet points.\n\n"
                     f"⚠ Very Important: DO NOT change the format, tone, or style. Continue exactly as in previous descriptions generated.\n\n"
                     f"Format each bullet point as:\n"
                     f"• First benefit\n"
@@ -578,19 +680,38 @@ class LLMClient:
                     f"Generate ONLY the 4 small bullet points for '{product_name}'. Use professional and simple pharmaceutical language."
                 )
             elif description_type == 'long':
+                detail_requirements = []
+                if metadata.get('strength'):
+                    detail_requirements.append(f"strength {metadata['strength']}")
+                if metadata.get('form'):
+                    detail_requirements.append(f"dosage form {metadata['form']}")
+                if metadata.get('pack_size'):
+                    detail_requirements.append(f"pack size {metadata['pack_size']}")
+                if metadata.get('category'):
+                    detail_requirements.append(f"therapeutic focus {metadata['category']}")
+
+                detail_sentence = ""
+                if detail_requirements:
+                    detail_sentence = (
+                        "Explicitly reference "
+                        + ", ".join(detail_requirements)
+                        + ". "
+                    )
+
                 return (
                     base_context +
                     f"You are helping me generate standardized product descriptions for an e-commerce platform selling pharmaceutical and healthcare products.\n\n"
                     f"Generate a LONG DESCRIPTION for '{product_name}' with these exact requirements:\n\n"
                     f"💊 Long Description:\n"
-                    f"7-8 lines\n"
+                    f"5-6 sentences (roughly 90-120 words)\n"
+                    f"Keep the entire passage under 850 characters\n"
                     f"SEO-optimized, professional, and easy to understand\n"
-                    f"Consistent tone and length\n"
-                    f"Should not be shortened or reduced to preserve SEO\n\n"
-                    f"Dont start with Titles for every product , just pure description of the product, no symbols too"
-                    f"no bullet points"
+                    f"Consistent tone and length\n\n"
+                    f"Start with a sentence that begins with {product_name} and mention the product name at least twice in total. "
+                    f"Do not use bullet points or headings. "
+                    + detail_sentence +
                     f"⚠ Very Important: DO NOT change the format, tone, or style. Continue exactly as in previous descriptions generated.\n\n"
-                    f"Generate a professional, detailed description of 7-8 lines for '{product_name}'. Make it SEO-optimized with consistent tone and maintain full length for SEO purposes."
+                    f"Generate a professional, detailed description of 5-6 sentences for '{product_name}'. Make it SEO-optimized with consistent tone and maintain full length for SEO purposes without exceeding the length limit."
                 )
             else:
                 logger.error(f"Invalid description type: {description_type}")
@@ -620,7 +741,7 @@ class LLMClient:
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 800,  # Reduced for faster processing while maintaining quality
-            "temperature": 0.02,  # Further reduced for maximum accuracy and consistency
+            "temperature": 0.15,  # Slightly higher for more descriptive variety
             "top_p": 0.9,        # Increased for better coverage
             "frequency_penalty": 0.3,  # Increased to reduce repetition
             "presence_penalty": 0.2   # Fine-tuned for diverse, accurate content
