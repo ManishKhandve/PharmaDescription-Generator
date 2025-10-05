@@ -7,6 +7,7 @@ import asyncio
 import httpx
 import time
 import logging
+import re
 from typing import Dict, Any, Optional
 import google.generativeai as genai
 
@@ -152,6 +153,7 @@ class LLMClient:
             for line in lines:
                 try:
                     line = str(line).strip().replace('*', '').replace('＊', '').replace('﹡', '').replace('∗', '')
+                    line = re.sub(r'^\s*\[[A-Z]{2,}\]\s*', '', line)
                     # Convert dash bullets to circle bullets
                     if line.startswith('- '):
                         line = '• ' + line[2:]
@@ -188,6 +190,9 @@ class LLMClient:
                 
                 # Remove inline code (`text`)
                 text = re.sub(r'`(.*?)`', r'\1', text)
+
+                # Remove standalone bracketed tokens like [BOT], [SYSTEM]
+                text = re.sub(r'\s*\[[A-Z]{2,}\]\s*', ' ', text)
                 
                 # Remove HTML tags if any
                 text = re.sub(r'<[^>]+>', '', text)
@@ -336,6 +341,7 @@ class LLMClient:
                 for line in lines:
                     try:
                         line = str(line).strip()
+                        line = re.sub(r'^\s*\[[A-Z]{2,}\]\s*', '', line)
                         if line.startswith('- '):
                             line = '• ' + line[2:]
                         elif line.startswith('-'):
@@ -348,7 +354,6 @@ class LLMClient:
                 description = '\n'.join(cleaned_lines)
                 
                 # Remove any markdown formatting that might have been missed
-                import re
                 try:
                     description = re.sub(r'\*\*(.*?)\*\*', r'\1', description)
                     description = re.sub(r'\*(.*?)\*', r'\1', description)
