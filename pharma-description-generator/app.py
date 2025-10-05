@@ -642,26 +642,39 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
             finally:
                 loop.close()
             successes = 0
+            failed = 0
             for entry, new_desc in zip(missing_short_entries, short_retry_results):
                 pname = entry.get('product_name', 'Unknown')
                 if isinstance(new_desc, Exception):
                     logger.debug(f"Short description batch retry failed for {pname}: {str(new_desc)}")
+                    failed += 1
                     continue
                 if new_desc is None or not str(new_desc).strip():
                     logger.debug(f"Short description batch retry returned empty result for {pname}")
+                    failed += 1
                     continue
                 cleaned = llm_client._clean_response(str(new_desc)) if hasattr(llm_client, '_clean_response') else str(new_desc)
                 formatted = llm_client._format_short_description_safely(cleaned, pname) if hasattr(llm_client, '_format_short_description_safely') else cleaned.strip()
                 if not formatted.strip():
                     logger.debug(f"Short description batch retry produced empty formatted output for {pname}")
+                    failed += 1
                     continue
+                
+                # Update the entry (which is a reference to the dict in all_results)
+                old_short = entry.get('short_description', '')
                 entry['short_description'] = formatted.strip()
                 successes += 1
+                
+                # Update status
                 if entry.get('long_description', '').strip():
                     entry['status'] = 'success'
                 else:
                     entry['status'] = 'partial'
-            logger.info(f"Short description batch retry filled {successes}/{len(missing_short_entries)} products")
+                
+                # Log successful update with length comparison
+                logger.info(f"✓ Updated short description for '{pname[:40]}': {len(old_short)} → {len(formatted)} chars")
+                
+            logger.info(f"Short description batch retry: {successes} succeeded, {failed} failed out of {len(missing_short_entries)} total")
 
         if missing_long_entries:
             logger.info(f"Attempting targeted batch retry for {len(missing_long_entries)} products missing long descriptions")
@@ -672,26 +685,39 @@ def process_file_async(job_id: str, file_path: str, api_key: str, model_type: st
             finally:
                 loop.close()
             successes = 0
+            failed = 0
             for entry, new_desc in zip(missing_long_entries, long_retry_results):
                 pname = entry.get('product_name', 'Unknown')
                 if isinstance(new_desc, Exception):
                     logger.debug(f"Long description batch retry failed for {pname}: {str(new_desc)}")
+                    failed += 1
                     continue
                 if new_desc is None or not str(new_desc).strip():
                     logger.debug(f"Long description batch retry returned empty result for {pname}")
+                    failed += 1
                     continue
                 cleaned = llm_client._clean_response(str(new_desc)) if hasattr(llm_client, '_clean_response') else str(new_desc)
                 formatted = llm_client._format_long_description_safely(cleaned, pname) if hasattr(llm_client, '_format_long_description_safely') else cleaned.strip()
                 if not formatted.strip():
                     logger.debug(f"Long description batch retry produced empty formatted output for {pname}")
+                    failed += 1
                     continue
+                
+                # Update the entry (which is a reference to the dict in all_results)
+                old_long = entry.get('long_description', '')
                 entry['long_description'] = formatted.strip()
                 successes += 1
+                
+                # Update status
                 if entry.get('short_description', '').strip():
                     entry['status'] = 'success'
                 else:
                     entry['status'] = 'partial'
-            logger.info(f"Long description batch retry filled {successes}/{len(missing_long_entries)} products")
+                
+                # Log successful update with length comparison
+                logger.info(f"✓ Updated long description for '{pname[:40]}': {len(old_long)} → {len(formatted)} chars")
+                
+            logger.info(f"Long description batch retry: {successes} succeeded, {failed} failed out of {len(missing_long_entries)} total")
 
         # Final check for missing with comprehensive analysis
         missing_products = get_missing_products(product_info_list, all_results)
