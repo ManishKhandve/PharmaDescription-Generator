@@ -6,8 +6,8 @@ Supports both models with standardized interface and error handling.
 import asyncio
 import httpx
 import time
+import uuid
 import logging
-import re
 from typing import Dict, Any, Optional
 import google.generativeai as genai
 
@@ -97,10 +97,10 @@ class LLMClient:
             
             # Configure generation settings for optimal speed and accuracy balance
             generation_config = genai.types.GenerationConfig(
-                temperature=0.15,       # Slightly reduced for better accuracy
+                temperature=0.02,       # Slightly reduced for better accuracy
                 top_p=0.85,            # Optimized for speed while maintaining quality
                 top_k=40,              # Balanced for speed and vocabulary coverage
-                max_output_tokens=800, # Reduced for faster generation
+                max_output_tokens=900, # Increased to ensure complete long descriptions without truncation
                 candidate_count=1       # Single best candidate
             )
             
@@ -137,15 +137,21 @@ class LLMClient:
             
             import re
             
+            # Remove model control tokens that shouldn't appear in output
+            # These are special tokens used by various AI models
+            control_tokens = [
+                '[Bot]', '[/Bot]', '[INST]', '[/INST]', '[SYS]', '[/SYS]',
+                '<|im_start|>', '<|im_end|>', '<s>', '</s>',
+                '[OUT]', '[/OUT]', '<bot>', '</bot>', '<assistant>', '</assistant>',
+                '<<SYS>>', '<</SYS>>', '[BINST]', '[/BINST]',
+                '[EOS]', '</EOS>', '<EOS>', '<eos>', '[/EOS]',
+                '[BOS]', '[BOT]', '[BOT\\]', '[/BOT]'
+            ]
+            for token in control_tokens:
+                text = text.replace(token, '')
+            
             # SUPER AGGRESSIVE ASTERISK REMOVAL - Remove ALL asterisks first (including unicode variants)
             text = str(text).replace('*', '').replace('＊', '').replace('﹡', '').replace('∗', '')
-
-            # Remove common bracketed markers or instruction tokens that some models emit
-            for marker in (
-                '[OUT]', '[/OUT]', '[IN]', '[/IN]', '[INST]', '[/INST]',
-                '[BINST]', '[/BINST]', '<OUT>', '</OUT>', '<INST>', '</INST>'
-            ):
-                text = text.replace(marker, '')
             
             # Now process line by line for bullet conversion
             lines = text.split('\n')
@@ -153,7 +159,6 @@ class LLMClient:
             for line in lines:
                 try:
                     line = str(line).strip().replace('*', '').replace('＊', '').replace('﹡', '').replace('∗', '')
-                    line = re.sub(r'^\s*\[[A-Z]{2,}\]\s*', '', line)
                     # Convert dash bullets to circle bullets
                     if line.startswith('- '):
                         line = '• ' + line[2:]
@@ -190,9 +195,6 @@ class LLMClient:
                 
                 # Remove inline code (`text`)
                 text = re.sub(r'`(.*?)`', r'\1', text)
-
-                # Remove standalone bracketed tokens like [BOT], [SYSTEM]
-                text = re.sub(r'\s*\[[A-Z]{2,}\]\s*', ' ', text)
                 
                 # Remove HTML tags if any
                 text = re.sub(r'<[^>]+>', '', text)
@@ -219,13 +221,20 @@ class LLMClient:
             # Return safe fallback
             return str(text).replace('*', '').strip() if text else ""
     
-    async def generate_description(self, product_name: str, description_type: str, category: str = None) -> str:
+    async def generate_description(
+        self,
+        product_name: str,
+        description_type: str,
+        category: str = None,
+        retry_context: Optional[Dict[str, Any]] = None
+    ) -> str:
         """
         Generate high-accuracy product description with validation.
         
         Args:
             product_name (str): Name of the pharmaceutical product
             description_type (str): Either 'short' or 'long'
+            retry_context (dict, optional): Context from previous attempts
             
         Returns:
             str: Generated description or empty string if failed
@@ -245,8 +254,26 @@ class LLMClient:
                 logger.error("Empty product name after cleaning")
                 return ""
             
-            metadata = self._extract_product_metadata(product_name, category)
-            prompt = self._get_prompt(product_name, description_type, category, metadata)
+            if retry_context:
+                try:
+                    logger.debug(
+                        "Retrying %s description for %s (attempt %s) with context keys=%s",
+                        description_type,
+                        product_name,
+                        retry_context.get('attempt'),
+                        list(retry_context.keys())
+                    )
+                except Exception:
+                    logger.debug(
+                        "Retrying %s description for %s with retry context", description_type, product_name
+                    )
+
+            prompt = self._get_prompt(
+                product_name,
+                description_type,
+                category,
+                retry_context=retry_context
+            )
             if not prompt:
                 logger.error(f"Failed to generate prompt for {product_name}")
                 return ""
@@ -341,7 +368,6 @@ class LLMClient:
                 for line in lines:
                     try:
                         line = str(line).strip()
-                        line = re.sub(r'^\s*\[[A-Z]{2,}\]\s*', '', line)
                         if line.startswith('- '):
                             line = '• ' + line[2:]
                         elif line.startswith('-'):
@@ -354,6 +380,7 @@ class LLMClient:
                 description = '\n'.join(cleaned_lines)
                 
                 # Remove any markdown formatting that might have been missed
+                import re
                 try:
                     description = re.sub(r'\*\*(.*?)\*\*', r'\1', description)
                     description = re.sub(r'\*(.*?)\*', r'\1', description)
@@ -535,86 +562,19 @@ class LLMClient:
             if '*' in description or '＊' in description or '﹡' in description or '∗' in description:
                 logger.warning('Asterisk detected in cleaned text! Forcing removal.')
                 description = description.replace('*', '').replace('＊', '').replace('﹡', '').replace('∗', '')
-            description = self._truncate_long_description(description)
             return description.strip()
             
         except Exception as e:
             logger.error(f"Error in long description formatting: {str(e)}")
             return str(description).replace('*', '').strip()
-
-    def _truncate_long_description(self, description: str, max_sentences: int = 6, max_chars: int = 850) -> str:
-        """Trim long descriptions to prevent truncation by the LLM or downstream storage."""
-        try:
-            import re
-
-            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', description) if s.strip()]
-            truncated = sentences[:max_sentences]
-            text = ' '.join(truncated)
-
-            while len(text) > max_chars and truncated:
-                truncated = truncated[:-1]
-                text = ' '.join(truncated)
-
-            if text:
-                return text.strip()
-
-            return description[:max_chars].strip()
-
-        except Exception as e:
-            logger.warning(f"Error truncating long description: {str(e)}")
-            return description[:max_chars].strip() if len(description) > max_chars else description
     
-    def _extract_product_metadata(self, product_name: str, category: Optional[str] = None) -> Dict[str, str]:
-        """Extract lightweight metadata from the product name to enrich prompts."""
-        metadata: Dict[str, str] = {}
-        try:
-            import re
-
-            name = product_name or ""
-
-            # Detect strength values (e.g., 500mg, 0.5 ml)
-            strength_match = re.search(
-                r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|kg|ml|l|iu|units|%|mcg)\b",
-                name,
-                flags=re.IGNORECASE,
-            )
-            if strength_match:
-                metadata['strength'] = strength_match.group().upper()
-
-            # Detect dosage form keywords
-            form_keywords = [
-                'Tablet', 'Tablets', 'Capsule', 'Capsules', 'Syrup', 'Injection', 'Solution',
-                'Cream', 'Gel', 'Ointment', 'Drops', 'Inhaler', 'Powder', 'Suspension',
-                'Lotion', 'Patch', 'Granules', 'Vial', 'Ampoule', 'Suppository', 'Spray'
-            ]
-            lower_name = name.lower()
-            for keyword in form_keywords:
-                if keyword.lower() in lower_name:
-                    metadata['form'] = keyword
-                    break
-
-            # Detect pack size indicators (e.g., Pack of 6, 10 Capsules, 6'S)
-            pack_patterns = [
-                r"\bpack\s*of\s*\d+\b",
-                r"\bset\s*of\s*\d+\b",
-                r"\b\d+\s*(?:tablets|capsules|sachets|ampoules|vials|strips|bottles|pieces)\b",
-                r"\b\d+['’`]?s\b",
-            ]
-            for pattern in pack_patterns:
-                match = re.search(pattern, name, flags=re.IGNORECASE)
-                if match:
-                    metadata['pack_size'] = match.group()
-                    break
-
-            if category:
-                metadata['category'] = str(category).strip()
-
-        except Exception as e:
-            logger.debug(f"Metadata extraction failed for {product_name}: {str(e)}")
-
-        return metadata
-
-    def _get_prompt(self, product_name: str, description_type: str, category: str = None, metadata: Optional[Dict[str, str]] = None) -> str:
+    def _get_prompt(
+        self,
+        product_name: str,
+        description_type: str,
+        category: str = None,
+        retry_context: Optional[Dict[str, Any]] = None
+    ) -> str:
         """
         Generate standardized product descriptions for e-commerce pharmaceutical platform.
         
@@ -633,11 +593,7 @@ class LLMClient:
             product_name = str(product_name).strip()
             if not product_name:
                 return ""
-
-            metadata = metadata or {}
-            if category and 'category' not in metadata and category:
-                metadata['category'] = str(category).strip()
-
+            
             # Compose strict context for both descriptions
             base_context = (
                 f"Important: The short description and long description must ALWAYS describe the SAME medicine.\n"
@@ -649,22 +605,45 @@ class LLMClient:
                 f"If uncertain, keep the description general but consistent across both short and long versions.\n"
             )
 
-            detail_lines = []
-            if metadata.get('strength'):
-                detail_lines.append(f"- Strength: {metadata['strength']}")
-            if metadata.get('form'):
-                detail_lines.append(f"- Dosage form: {metadata['form']}")
-            if metadata.get('pack_size'):
-                detail_lines.append(f"- Pack size: {metadata['pack_size']}")
-            if metadata.get('category'):
-                detail_lines.append(f"- Therapeutic category: {metadata['category']}")
+            if retry_context:
+                try:
+                    attempt = retry_context.get('attempt')
+                    missing = retry_context.get('missing')
+                    existing_short = (retry_context.get('existing_short') or '').strip()
+                    existing_long = (retry_context.get('existing_long') or '').strip()
+                    previous_errors = retry_context.get('previous_errors')
 
-            if detail_lines:
-                base_context += (
-                    "\nProduct-specific facts (mention each of these explicitly):\n"
-                    + "\n".join(detail_lines)
-                    + "\nAlways weave these facts into the narrative without inventing new data.\n"
-                )
+                    def _trim(value: str, limit: int = 400) -> str:
+                        value = value.strip()
+                        if len(value) <= limit:
+                            return value
+                        return value[:limit].rstrip() + "..."
+
+                    context_lines = []
+                    if attempt and attempt > 1:
+                        context_lines.append(
+                            f"This is attempt #{attempt}. The previous attempt did not produce a complete {description_type} description."
+                        )
+                    if missing == 'long' and existing_short:
+                        context_lines.append(
+                            "Keep the long description aligned with this approved short description (do NOT rewrite it):\n"
+                            f"{_trim(existing_short)}"
+                        )
+                    if missing == 'short' and existing_long:
+                        context_lines.append(
+                            "Generate the short bullet points so they match this already approved long description (do NOT contradict it):\n"
+                            f"{_trim(existing_long)}"
+                        )
+                    if previous_errors:
+                        context_lines.append(f"Previous issues to avoid: {_trim(str(previous_errors), 200)}")
+
+                    if context_lines:
+                        base_context += "\n" + "\n".join(context_lines) + "\n"
+                except Exception as context_error:
+                    logger.debug(f"Retry context could not be attached to prompt for {product_name}: {context_error}")
+
+            if category:
+                base_context += f"\nCategory: {category}\nUse the category only if it is relevant to the product's therapeutic use or context.\n"
 
             if description_type == 'short':
                 return (
@@ -672,10 +651,8 @@ class LLMClient:
                     f"You are helping me generate standardized product descriptions for an e-commerce platform selling pharmaceutical and healthcare products.\n\n"
                     f"Generate a SHORT DESCRIPTION for '{product_name}' with these exact requirements:\n\n"
                     f"✅ Short Description:\n"
-                    f"• 4 concise bullet points, no trailing punctuation\n\n"
-                    f"• First bullet must mention {product_name}\n"
-                    f"• Mention every fact listed above (strength, dosage form, pack size, category when available)\n"
-                    f"• Do NOT use numbers or numbering (like 1., 2., etc.) after the bullet points—just plain bullet points.\n\n"
+                    f"• 4 concise small bullet points, no punctuation at the end\n\n"
+                     f"• Do NOT use numbers or numbering (like 1., 2., etc.) after the bullet points—just plain bullet points.\n\n"
                     f"⚠ Very Important: DO NOT change the format, tone, or style. Continue exactly as in previous descriptions generated.\n\n"
                     f"Format each bullet point as:\n"
                     f"• First benefit\n"
@@ -685,38 +662,20 @@ class LLMClient:
                     f"Generate ONLY the 4 small bullet points for '{product_name}'. Use professional and simple pharmaceutical language."
                 )
             elif description_type == 'long':
-                detail_requirements = []
-                if metadata.get('strength'):
-                    detail_requirements.append(f"strength {metadata['strength']}")
-                if metadata.get('form'):
-                    detail_requirements.append(f"dosage form {metadata['form']}")
-                if metadata.get('pack_size'):
-                    detail_requirements.append(f"pack size {metadata['pack_size']}")
-                if metadata.get('category'):
-                    detail_requirements.append(f"therapeutic focus {metadata['category']}")
-
-                detail_sentence = ""
-                if detail_requirements:
-                    detail_sentence = (
-                        "Explicitly reference "
-                        + ", ".join(detail_requirements)
-                        + ". "
-                    )
-
                 return (
                     base_context +
                     f"You are helping me generate standardized product descriptions for an e-commerce platform selling pharmaceutical and healthcare products.\n\n"
                     f"Generate a LONG DESCRIPTION for '{product_name}' with these exact requirements:\n\n"
                     f"💊 Long Description:\n"
-                    f"5-6 sentences (roughly 90-120 words)\n"
-                    f"Keep the entire passage under 850 characters\n"
+                    f"EXACTLY 5-6 complete lines (approximately 120-150 words maximum)\n"
+                    f"Keep it concise and focused\n"
                     f"SEO-optimized, professional, and easy to understand\n"
-                    f"Consistent tone and length\n\n"
-                    f"Start with a sentence that begins with {product_name} and mention the product name at least twice in total. "
-                    f"Do not use bullet points or headings. "
-                    + detail_sentence +
+                    f"Consistent tone and length\n"
+                    f"MUST end with a complete sentence - do NOT stop mid-sentence\n\n"
+                    f"Dont start with Titles for every product , just pure description of the product, no symbols too\n"
+                    f"no bullet points\n"
                     f"⚠ Very Important: DO NOT change the format, tone, or style. Continue exactly as in previous descriptions generated.\n\n"
-                    f"Generate a professional, detailed description of 5-6 sentences for '{product_name}'. Make it SEO-optimized with consistent tone and maintain full length for SEO purposes without exceeding the length limit."
+                    f"⚠ CRITICAL: Keep it SHORT and CONCISE (120-150 words max). Complete ALL sentences. Do not stop mid-sentence. Generate EXACTLY 5-6 complete lines for '{product_name}'. Make it SEO-optimized with consistent tone."
                 )
             else:
                 logger.error(f"Invalid description type: {description_type}")
@@ -746,7 +705,7 @@ class LLMClient:
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 800,  # Reduced for faster processing while maintaining quality
-            "temperature": 0.15,  # Slightly higher for more descriptive variety
+            "temperature": 0.02,  # Further reduced for maximum accuracy and consistency
             "top_p": 0.9,        # Increased for better coverage
             "frequency_penalty": 0.3,  # Increased to reduce repetition
             "presence_penalty": 0.2   # Fine-tuned for diverse, accurate content
@@ -764,7 +723,25 @@ class LLMClient:
                     if response.status_code == 200:
                         result = response.json()
                         raw_content = result["choices"][0]["message"]["content"].strip()
-                        return self._clean_response(raw_content)
+                        
+                        # Check if response is empty or contains only whitespace/control tokens
+                        if not raw_content or len(raw_content) < 10:
+                            logger.warning(f"Empty or very short API response (attempt {attempt + 1}), retrying...")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 + attempt)
+                                continue
+                            return ""
+                        
+                        cleaned = self._clean_response(raw_content)
+                        # Verify cleaned content is not empty
+                        if not cleaned or len(cleaned.strip()) < 10:
+                            logger.warning(f"Content became empty after cleaning (attempt {attempt + 1}), retrying...")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 + attempt)
+                                continue
+                            return ""
+                        
+                        return cleaned
                     elif response.status_code == 429:  # Rate limit
                         # Enhanced rate limiting strategy
                         wait_time = min(60, (2 ** attempt) + (attempt * 2))  # Cap at 60 seconds
@@ -872,8 +849,15 @@ class BatchProcessor:
         self.batch_size = batch_size
         self.cache = {}  # Simple in-memory cache for repeated products
         self.rate_limiter = RateLimiter(base_delay=0.3, max_delay=10.0)  # Lower base delay and max delay
+        self.retry_metadata: Dict[str, Dict[str, Any]] = {}
         
-    async def process_products(self, products: list, progress_callback=None, stop_check=None) -> list:
+    async def process_products(
+        self,
+        products: list,
+        progress_callback=None,
+        stop_check=None,
+        existing_results: Optional[Dict[str, Any]] = None
+    ) -> list:
         """
         Process list of products in batches with enhanced progress tracking and error recovery.
         Optimized for large datasets (10,000+ products).
@@ -882,14 +866,14 @@ class BatchProcessor:
             products (list): List of product names
             progress_callback (callable): Optional callback for progress updates
             stop_check (callable): Optional function to check if processing should stop
+            existing_results (dict, optional): Previously captured results for context-aware retries
             
         Returns:
             list: List of dictionaries with product info and descriptions
         """
+        existing_results = existing_results or {}
         results = []
         total_products = len(products)
-        failed_products = []
-        
         logger.info(f"Starting batch processing of {total_products} products with batch size {self.batch_size}")
         
         for i in range(0, total_products, self.batch_size):
@@ -904,60 +888,33 @@ class BatchProcessor:
             # Apply rate limiting before each batch
             await self.rate_limiter.wait_if_needed()
             
-            batch_results = await self._process_batch_with_retry(batch)
-            
-            # Separate successful and failed results with better logging
-            batch_successful = 0
-            batch_failed = 0
+            batch_results = await self._process_batch_with_retry(batch, existing_results)
+
             for result in batch_results:
-                if not isinstance(result, dict):
-                    batch_failed += 1
-                    logger.warning(f"Unexpected result type encountered: {type(result)}")
+                if isinstance(result, Exception):
+                    logger.debug(f"Batch returned exception: {result}")
                     continue
+                results.append(result)
 
-                original_product = result.pop('original_product', None)
-                product_name = result.get('product_name', 'Unknown')
-
-                if result.get('status') == 'failed':
-                    batch_failed += 1
-                    logger.debug(f"Product failed: {product_name} - {result.get('error', 'Unknown error')}")
-
-                    if original_product:
-                        failed_products.append(original_product)
-                    else:
-                        failed_products.append({'product_name': product_name})
-
-                    # Ensure failed results are still tracked for downstream processing
-                    results.append(result)
-                else:
-                    results.append(result)
-                    batch_successful += 1
-            
-            logger.info(f"Batch {i//self.batch_size + 1} completed: {batch_successful} successful, {batch_failed} failed")
-            
             # Update progress with detailed info
             if progress_callback:
-                progress = min(100, int((i + len(batch)) / total_products * 100))
-                success_count = len(results)
-                failed_count = len(failed_products)
-                # Updated callback to include failed count
+                success_count = len([r for r in results if isinstance(r, dict) and r.get('status') == 'success'])
+                incomplete_count = len([r for r in results if isinstance(r, dict) and r.get('status') != 'success'])
+                processed_so_far = min(i + len(batch), total_products)
+                progress = min(100, int((processed_so_far / total_products) * 100))
                 if progress_callback.__code__.co_argcount >= 4:
-                    progress_callback(progress, success_count, total_products, failed_count)
+                    progress_callback(progress, success_count, total_products, incomplete_count)
                 else:
                     progress_callback(progress, success_count, total_products)
             
             # Adaptive delay based on API performance - reduced for speed
-            await asyncio.sleep(self._calculate_delay(len(failed_products), len(results)))
-            
-        # Skip retry of failed products for faster processing - only retry critical failures
-        if failed_products and len(failed_products) <= 10:  # Reduced retry threshold
-            logger.info(f"Retrying {len(failed_products)} critical failed products...")
-            retry_results = await self._retry_failed_products_fast(failed_products[:10], stop_check)
-            results.extend(retry_results)
-        
-        total_success = sum(1 for r in results if isinstance(r, dict) and r.get('status') != 'failed')
-        total_failed = sum(1 for r in results if isinstance(r, dict) and r.get('status') == 'failed')
-        logger.info(f"Batch processing complete: {total_success} successful, {total_failed} failed")
+            await asyncio.sleep(self._calculate_delay(incomplete_count, success_count))
+
+        success_total = len([r for r in results if isinstance(r, dict) and r.get('status') == 'success'])
+        incomplete_total = len([r for r in results if isinstance(r, dict) and r.get('status') != 'success'])
+        logger.info(
+            f"Batch processing complete: {success_total} successful, {incomplete_total} incomplete/failed"
+        )
         return results
         
     def _calculate_delay(self, failed_count: int, success_count: int) -> float:
@@ -972,13 +929,81 @@ class BatchProcessor:
             return 0.7  # Reduced medium delay
         else:
             return 0.3  # Reduced short delay
+
+    def _build_retry_context(
+        self,
+        product_name: str,
+        existing_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """Create retry context payloads for short and long description prompts."""
+        normalized = (product_name or "").lower().strip()
+        if not normalized:
+            normalized = str(uuid.uuid4())  # Fallback to unique key to avoid collisions
+
+        prior_meta = self.retry_metadata.get(normalized, {}) if normalized else {}
+        base_attempt = max(1, int(prior_meta.get('attempt', 0)) + 1)
+
+        if existing_context and isinstance(existing_context, dict):
+            try:
+                base_attempt = max(base_attempt, int(existing_context.get('attempt', 1)) + 1)
+            except Exception:
+                base_attempt = max(base_attempt, 2)
+
+        existing_short = ((existing_context or {}).get('short_description') or '').strip()
+        existing_long = ((existing_context or {}).get('long_description') or '').strip()
+        previous_errors = (existing_context or {}).get('errors') or prior_meta.get('last_error')
+
+        if existing_context is not None and isinstance(existing_context, dict):
+            short_completed = bool(existing_context.get('short_completed'))
+            long_completed = bool(existing_context.get('long_completed'))
+        else:
+            short_completed = bool(prior_meta.get('short_completed'))
+            long_completed = bool(prior_meta.get('long_completed'))
+
+        meta = {
+            'attempt': base_attempt,
+            'existing_short': existing_short,
+            'existing_long': existing_long,
+            'previous_errors': previous_errors,
+            'short_completed': short_completed,
+            'long_completed': long_completed
+        }
+
+        short_context = {
+            'attempt': base_attempt,
+            'existing_short': existing_short,
+            'existing_long': existing_long,
+            'previous_errors': previous_errors,
+            'missing': None
+        }
+
+        long_context = dict(short_context)
+
+        if existing_context:
+            if not short_completed:
+                short_context['missing'] = 'short'
+            if not long_completed:
+                long_context['missing'] = 'long'
+
+        self.retry_metadata[normalized] = {
+            'attempt': base_attempt,
+            'timestamp': time.time(),
+            'short_completed': short_completed,
+            'long_completed': long_completed
+        }
+
+        return {
+            'meta': meta,
+            'short': short_context,
+            'long': long_context
+        }
     
     async def _retry_failed_products_fast(self, failed_products: list, stop_check=None) -> list:
         """
         Fast retry for critically failed products with minimal overhead.
         
         Args:
-            failed_products (list): List of failed product dictionaries
+            failed_products (list): List of failed product names
             stop_check (callable): Function to check for stop request
             
         Returns:
@@ -999,8 +1024,7 @@ class BatchProcessor:
                 retry_results.append(result)
                 
             except Exception as e:
-                product_name = product.get('product_name', 'Unknown') if isinstance(product, dict) else str(product)
-                logger.debug(f"Retry failed for {product_name}: {str(e)}")
+                logger.debug(f"Retry failed for {product}: {str(e)}")
                 # Don't add failed retries to avoid duplicates
                 continue
                 
@@ -1009,12 +1033,17 @@ class BatchProcessor:
         
         return retry_results
     
-    async def _process_batch_with_retry(self, batch: list) -> list:
+    async def _process_batch_with_retry(
+        self,
+        batch: list,
+        existing_results: Optional[Dict[str, Any]] = None
+    ) -> list:
         """
         Optimized batch processing with parallel execution and smart retry logic.
         
         Args:
             batch (list): List of product names to process
+            existing_results (dict, optional): Previously captured results to reuse partial data
             
         Returns:
             list: Processed results for the batch
@@ -1025,79 +1054,66 @@ class BatchProcessor:
         tasks = []
         for product in batch:
             # product is a dict: {"product_name": ..., "category": ...}
-            cache_key = product["product_name"].lower().strip()
-            if cache_key in self.cache:
-                cached_result = dict(self.cache[cache_key])
-                cached_result['original_product'] = product
+            product_name = str(product.get("product_name", "")).strip()
+            cache_key = product_name.lower()
+
+            cached_result = self.cache.get(cache_key)
+            if cached_result and cached_result.get('status') == 'success':
                 batch_results.append(cached_result)
                 continue
 
-            # Create task for this product
-            task = self._process_single_product_fast(product)
-            tasks.append((product, task))
+            context = existing_results.get(cache_key)
+
+            task = self._process_single_product_fast(product, existing_context=context)
+            tasks.append((product, task, cache_key))
         
         # Process remaining tasks in parallel with reduced timeout
         if tasks:
             try:
                 # Run all tasks concurrently with timeout
                 task_results = await asyncio.wait_for(
-                    asyncio.gather(*[task for _, task in tasks], return_exceptions=True),
+                    asyncio.gather(*[task for _, task, _ in tasks], return_exceptions=True),
                     timeout=18.0
                 )
                 
                 # Process results
-                for i, (product, _) in enumerate(tasks):
+                for i, (product, _, cache_key) in enumerate(tasks):
                     if i < len(task_results):
                         result = task_results[i]
                         if isinstance(result, Exception):
                             # Handle failed products
-                            result_dict = {
+                            result = {
                                 'product_name': product.get('product_name', str(product)),
                                 'short_description': '',
                                 'long_description': '',
                                 'status': 'failed',
                                 'error': str(result)
                             }
-                        elif isinstance(result, dict):
-                            result_dict = dict(result)
                         else:
-                            result_dict = {
-                                'product_name': product.get('product_name', str(product)),
-                                'short_description': '',
-                                'long_description': '',
-                                'status': 'failed',
-                                'error': f"Unexpected result type: {type(result)}"
-                            }
-
-                        # Cache successful results without original metadata
-                        if result_dict.get('status', 'success') != 'failed':
-                            cache_key_product = product.get('product_name', str(product)).lower().strip()
-                            self.cache[cache_key_product] = {
-                                'product_name': result_dict.get('product_name', product.get('product_name', str(product))),
-                                'short_description': result_dict.get('short_description', ''),
-                                'long_description': result_dict.get('long_description', ''),
-                                'status': result_dict.get('status', 'success')
-                            }
-
-                        result_dict['original_product'] = product
-                        batch_results.append(result_dict)
+                            # Cache successful results
+                            if result.get('status') == 'success':
+                                self.cache[cache_key] = result
+                        batch_results.append(result)
                 
             except asyncio.TimeoutError:
                 logger.warning(f"Batch timeout for {len(tasks)} products, creating empty results")
                 # Create failed results for timeout
-                for product, _ in tasks:
+                for product, _, _ in tasks:
                     batch_results.append({
                         'product_name': product.get('product_name', str(product)),
                         'short_description': '',
                         'long_description': '',
                         'status': 'failed',
-                        'error': 'Timeout',
-                        'original_product': product
+                        'error': 'Timeout'
                     })
         
         return batch_results
     
-    async def _process_single_product_fast(self, product_info: dict) -> Dict[str, Any]:
+    async def _process_single_product_fast(
+        self,
+        product_info: dict,
+        existing_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Fast single product processing with optimized concurrent description generation.
         
@@ -1108,23 +1124,23 @@ class BatchProcessor:
             dict: Product information with generated descriptions
         """
         try:
-            product_name = product_info.get("product_name", "").strip()
+            product_name = product_info.get("product_name", "")
             category = product_info.get("category", None)
-            
-            # Skip empty product names
-            if not product_name:
-                logger.warning("Empty product name encountered, skipping")
-                return {
-                    'product_name': '',
-                    'short_description': '',
-                    'long_description': '',
-                    'status': 'failed',
-                    'error': 'Empty product name'
-                }
-            
             # Generate both descriptions concurrently for speed
-            short_task = self.llm_client.generate_description(product_name, 'short', category)
-            long_task = self.llm_client.generate_description(product_name, 'long', category)
+            retry_payload = self._build_retry_context(product_name, existing_context)
+
+            short_task = self.llm_client.generate_description(
+                product_name,
+                'short',
+                category,
+                retry_context=retry_payload['short']
+            )
+            long_task = self.llm_client.generate_description(
+                product_name,
+                'long',
+                category,
+                retry_context=retry_payload['long']
+            )
 
             # Wait for both with timeout
             short_desc, long_desc = await asyncio.wait_for(
@@ -1170,12 +1186,52 @@ class BatchProcessor:
                 long_desc = self.llm_client._clean_response(long_desc)
                 # EXTRA asterisk removal for long descriptions
                 long_desc = long_desc.replace('*', '')
+                
+                # Check if long description is incomplete (doesn't end with proper punctuation)
+                if long_desc and not long_desc.rstrip().endswith(('.', '!', '?')):
+                    logger.warning(f"Long description for '{product_name}' may be incomplete (doesn't end with punctuation): ...{long_desc[-50:]}")
             
+            # Require BOTH descriptions to be present for success
+            short_completed = bool(short_desc and short_desc.strip())
+            long_completed = bool(long_desc and long_desc.strip())
+            has_both = short_completed and long_completed
+
             result = {
                 'product_name': product_name,
                 'short_description': short_desc,
                 'long_description': long_desc,
-                'status': 'success' if (short_desc or long_desc) else 'failed'
+                'status': 'success' if has_both else 'failed',
+                'attempt': retry_payload['meta']['attempt'],
+                'short_completed': short_completed,
+                'long_completed': long_completed
+            }
+
+            if not has_both:
+                missing_parts = []
+                if not short_completed:
+                    missing_parts.append('short')
+                if not long_completed:
+                    missing_parts.append('long')
+                if missing_parts and 'error' not in result:
+                    result['error'] = f"Missing {' & '.join(missing_parts)} description"
+
+            if existing_context and 'errors' in existing_context and existing_context['errors']:
+                result.setdefault('errors', existing_context['errors'])
+
+            # Log if only one description is missing
+            if short_desc and not long_desc:
+                logger.warning(f"Missing long description for {product_name}")
+            elif long_desc and not short_desc:
+                logger.warning(f"Missing short description for {product_name}")
+
+            normalized = product_name.lower().strip()
+            self.retry_metadata[normalized] = {
+                'attempt': retry_payload['meta']['attempt'],
+                'timestamp': time.time(),
+                'short_completed': short_completed,
+                'long_completed': long_completed,
+                'last_status': result['status'],
+                'last_error': result.get('error') or result.get('errors')
             }
             
             return result

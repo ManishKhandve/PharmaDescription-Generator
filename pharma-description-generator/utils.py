@@ -98,25 +98,6 @@ class ExcelHandler:
             if not product_info:
                 raise ValueError("No valid product names found in first column")
 
-            # Remove any existing description columns from the original DataFrame to avoid conflicts
-            # This ensures we generate fresh descriptions regardless of pre-existing ones
-            description_keywords = [
-                'description', 'short description', 'long description', 'short_description', 'long_description',
-                'desc', 'short desc', 'long desc', 'product description', 'item description',
-                'details', 'product details', 'summary', 'overview'
-            ]
-            
-            columns_to_remove = []
-            for col in df.columns:
-                col_name_lower = str(col).strip().lower()
-                if any(keyword in col_name_lower for keyword in description_keywords):
-                    columns_to_remove.append(col)
-                    logger.info(f"Ignoring existing description column: '{col}'")
-            
-            if columns_to_remove:
-                df = df.drop(columns=columns_to_remove)
-                logger.info(f"Removed {len(columns_to_remove)} existing description columns")
-
             logger.info(f"Successfully read {len(product_info)} products from {file_path}")
             return product_info, df
             
@@ -685,6 +666,10 @@ class ProgressTracker:
             self.total_count = 0
             self.processed_count = 0
             self.results = []
+        self.total_count = total_products
+        self.processed_count = 0
+        self.results = []
+        logger.info(f"Initialized progress tracking for {total_products} products")
     
     def update_progress(self, new_results: List[Dict[str, Any]]):
         """
