@@ -1,10 +1,10 @@
- 🧬 Pharmaceutical Description Generator
+  Pharmaceutical Description Generator
 
 A **production-ready Python web application** for generating **standardized short and long product descriptions** for pharmaceutical and healthcare products using AI models (Mistral 7B via OpenRouter & Gemini 1.5 Flash).
 
 ---
 
-## ✨ Features
+##  Features
 
 * **AI-Powered Generation** → Leverages Mistral 7B (OpenRouter) or Gemini 1.5 Flash for compliant, professional descriptions
 * **Batch Processing** → Handles up to **50,000 products** with concurrent execution
@@ -21,7 +21,7 @@ A **production-ready Python web application** for generating **standardized shor
 
 ---
 
-## 📋 Requirements
+##  Requirements
 
 * Python **3.8+**
 * Internet connection for API calls
@@ -29,7 +29,7 @@ A **production-ready Python web application** for generating **standardized shor
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 1. **Install dependencies**
 
@@ -44,11 +44,11 @@ A **production-ready Python web application** for generating **standardized shor
    ```
 
 3. **Open in browser**
-   👉 [http://127.0.0.1:5000](http://127.0.0.1:5000)
+    [http://127.0.0.1:5000](http://127.0.0.1:5000)
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 pharma-description-generator/
@@ -66,7 +66,7 @@ pharma-description-generator/
 
 ---
 
-## 📊 Input Format
+##  Input Format
 
 * **Column A:** Product/medicine names (required)
 * Other columns → ignored
@@ -86,7 +86,7 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## 📈 Output Format
+##  Output Format
 
 * **Column A:** Product Name (original)
 * **Column B:** Short Description (4 bullet points)
@@ -94,7 +94,7 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## 🔑 API Keys
+## API Keys
 
 **Mistral AI:**
 
@@ -106,11 +106,11 @@ Vitamin D3 1000 IU Softgels
 * [https://makersuite.google.com](https://makersuite.google.com) → Get key
 * Select **Gemini 1.5 Flash**
 
-👉 Keys are **never stored**, only used for the current process.
+ Keys are **never stored**, only used for the current process.
 
 ---
 
-## 🎯 Usage Instructions
+##  Usage Instructions
 
 1. **Upload File** → Select Excel file (validated automatically)
 2. **Configure** → Enter API key & choose model (Mistral = speed, Gemini = quality)
@@ -119,7 +119,7 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## ⚡ Performance (Estimates)
+##  Performance (Estimates)
 
 | Products | Mistral Small | Gemini 1.5 Flash |
 | -------- | ------------- | ---------------- |
@@ -130,7 +130,7 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## 🛠 Advanced Configuration
+##  Advanced Configuration
 
 * **Batch Size (default 5)** → configurable in `llm_client.py`
 * **Retries (default 3)** → exponential backoff
@@ -138,18 +138,18 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## 🔧 Troubleshooting
+##  Troubleshooting
 
 * **Invalid API Key** → Check key & credits
 * **File too large** → Max 50MB
 * **Processing failed** → Retry with smaller batch, check connection
 * **Empty outputs** → Could be API rate limits; retry after delay
 
-👉 Partial results saved every 100 products for recovery
+ Partial results saved every 100 products for recovery
 
 ---
 
-## 📝 Customization
+##  Customization
 
 * **Modify Prompts** → In `llm_client.py`
 * **Adjust Batch Size** → In `app.py`
@@ -157,7 +157,7 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## 🔒 Security & Privacy
+## Security & Privacy
 
 * API keys → never logged or stored
 * Uploaded files → deleted after processing
@@ -167,7 +167,7 @@ Vitamin D3 1000 IU Softgels
 
 ---
 
-## 🌟 Deployment
+##  Deployment
 
 **Gunicorn** (recommended):
 
@@ -185,7 +185,7 @@ export FLASK_DEBUG=False
 
 ---
 
-## 🧹 Cleanup
+##  Cleanup
 
 * Outputs → auto-deleted in 24h
 * Uploads → removed post-processing
@@ -194,7 +194,7 @@ export FLASK_DEBUG=False
 
 ---
 
-## 📞 Support
+##  Support
 
 * Check console logs
 * Verify API credits & connection
@@ -211,20 +211,19 @@ export FLASK_DEBUG=False
 
 ---
 
-## 📄 License
+##  License
 
 Provided as-is for **pharmaceutical & healthcare businesses**. Extend/customize as needed.
 
 ---
 
-## 🔄 Version History
+##  Version History
 
 * **v1.0** → Initial release with Mistral & Gemini support
 * **v1.1** → Added progress tracking & large file handling
 * **v1.2** → Improved error recovery & batch processing
 
 ---
-
-✅ Ready to generate **professional pharma descriptions at scale!**
+ Ready to generate **professional pharma descriptions at scale!**
 
 
